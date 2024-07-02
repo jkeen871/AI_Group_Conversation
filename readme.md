@@ -25,13 +25,13 @@ The AI Conversation CLI is an interactive command-line application that facilita
 
 ## 2. Screenshots
 
-![AI Conversation CLI Interface](screenshots/Screenshot-from-2024-07-02-12-49-53.png)
+![AI Conversation CLI Interface](screenshots/2024-07-02-12-49-53.png)
 
-![AI Conversation CLI Interface](screenshots/Screenshot-from-2024-07-02-12-50-34.png)
+![AI Conversation CLI Interface](screenshots/2024-07-02-12-50-34.png)
 
-![AI Conversation CLI Interface](screenshots/Screenshot-from-2024-07-02-12-50-48.png)
+![AI Conversation CLI Interface](screenshots/2024-07-02-12-50-48.png)
 
-![AI Conversation CLI Interface](screenshots/Screenshot-from-2024-07-02-12-52-20.png)
+![AI Conversation CLI Interface](screenshots/2024-07-02-12-52-20.png)
 
 ## 3. Entering Prompts for Group Conversations
 
