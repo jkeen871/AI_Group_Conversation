@@ -24,8 +24,9 @@
 The AI Conversation CLI is an interactive command-line application that facilitates conversations with multiple AI personalities using advanced language models. It manages complex conversation flows and provides a rich text user interface for interacting with AI agents.
 
 ## 2. Screenshots
+https://github.com/jkeen871/AI_Group_Conversation/blob/master/screenshots/2024-07-02%2012-49-53.png
 
-![AI Conversation CLI Interface](screenshots/2024-07-02-12-49-53.png)
+![AI Conversation CLI Interface](https://github.com/jkeen871/AI_Group_Conversation/blob/master/screenshots/2024-07-02%2012-49-53.png)
 
 ![AI Conversation CLI Interface](screenshots/2024-07-02-12-50-34.png)
 
