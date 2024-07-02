@@ -1,10 +1,57 @@
-# AI Conversation CLI Detailed Technical Documentation
+# AI Conversation CLI Technical Documentation
 
-## Project Overview
+## Table of Contents
+1. [Project Overview](#1-project-overview)
+2. [Screenshots](#2-screenshots)
+3. [Entering Prompts for Group Conversations](#3-entering-prompts-for-group-conversations)
+4. [Sample Conversation](#4-sample-conversation)
+5. [Project Structure](#5-project-structure)
+6. [File Dependencies](#6-file-dependencies)
+7. [Module Dependencies](#7-module-dependencies)
+8. [Configuration and Security Files](#8-configuration-and-security-files)
+9. [Detailed File Descriptions](#9-detailed-file-descriptions)
+10. [Creating and Configuring Dependent Files](#10-creating-and-configuring-dependent-files)
+11. [Setup and Running the Application](#11-setup-and-running-the-application)
+12. [Error Handling and Logging](#12-error-handling-and-logging)
+13. [Extending the Application](#13-extending-the-application)
+14. [Testing](#14-testing)
+15. [Performance Considerations](#15-performance-considerations)
+16. [Security Considerations](#16-security-considerations)
+17. [Additional Notes](#17-additional-notes)
+
+## 1. Project Overview
 
 The AI Conversation CLI is an interactive command-line application that facilitates conversations with multiple AI personalities using advanced language models. It manages complex conversation flows and provides a rich text user interface for interacting with AI agents.
 
-## Project Structure
+## 2. Screenshots
+
+![AI Conversation CLI Interface](screenshots/Screenshot from 2024-07-02 12-49-53.png)
+![AI Conversation CLI Interface](screenshots/Screenshot from 2024-07-02 12-50-34.png)
+![AI Conversation CLI Interface](screenshots/Screenshot from 2024-07-02 12-50-48.png)
+![AI Conversation CLI Interface](screenshots/Screenshot from 2024-07-02 12-52-20.png)
+
+
+## 3. Entering Prompts for Group Conversations
+
+To initiate a group conversation with the AI personalities, follow these guidelines:
+
+1. Start the application and choose the desired participants.
+2. Enter your prompt, addressing it to the group or a specific participant.
+3. The AI personalities will engage in a discussion based on your prompt.
+
+Examples:
+
+- General prompt: "What are your thoughts on renewable energy?"
+- Specific participant prompt: "Vanessa, what's your perspective on social media's impact on society?"
+- Follow-up prompt: "Lukas, can you provide some data to support or challenge the previous points?"
+
+Remember, you can always interject or steer the conversation by addressing specific participants or asking for clarification on certain points.
+
+## 4. Sample Conversation
+
+For a detailed example of how the AI personalities interact in a conversation, please refer to the [sample conversation](sample_conversation.md).
+
+## 5. Project Structure
 
 The project consists of the following Python files:
 
@@ -14,7 +61,7 @@ The project consists of the following Python files:
 4. `personalities.py`: Defines AI personalities and their characteristics
 5. `ai_config.py`: Configuration for AI models and related settings
 
-## File Dependencies
+## 6. File Dependencies
 
 ### convo.py
 - Imports:
@@ -48,7 +95,7 @@ The project consists of the following Python files:
   - `AI_PERSONALITIES` from `personalities.py`
   - `ainput` from `aioconsole` (with fallback to asyncio.run(input))
 
-## Module Dependencies
+## 7. Module Dependencies
 
 - Python Standard Library:
   - `asyncio`
@@ -68,7 +115,7 @@ The project consists of the following Python files:
     - `openai`: For OpenAI GPT models
     - `anthropic`: For Anthropic's Claude model
 
-## Configuration and Security Files
+## 8. Configuration and Security Files
 
 The project uses several configuration files to manage API keys, tokens, and credentials. These files are crucial for securely connecting to various AI services and should be handled with care.
 
@@ -180,16 +227,7 @@ oauth_client = SomeOAuthClient(
 )
 ```
 
-## Security Considerations for Configuration Files
-
-1. **Never commit these files to version control:** Add them to your .gitignore file to prevent accidental commits.
-2. **Use environment variables:** For production or shared environments, consider using environment variables instead of files to store sensitive data.
-3. **Implement proper file permissions:** Ensure these files have restricted read/write permissions on the server.
-4. **Encryption:** Consider encrypting the contents of these files for an added layer of security.
-5. **Regular rotation:** Implement a policy to regularly rotate API keys and update these files.
-6. **Separate configurations:** Use different keys/credentials for development, staging, and production environments.
-
-## Detailed File Descriptions
+## 9. Detailed File Descriptions
 
 ### convo.py
 
@@ -253,7 +291,7 @@ Configuration for AI models and related settings.
 - `log_ai_error()`: Function to log AI-specific errors
 - AI model-specific configuration and functions
 
-## Creating and Configuring Dependent Files
+## 10. Creating and Configuring Dependent Files
 
 ### personalities.py
 
@@ -319,7 +357,7 @@ AI_CONFIG["gpt4"]["generate_func"] = openai_generate
 AI_CONFIG["claude"]["generate_func"] = anthropic_generate
 ```
 
-## Setup and Running the Application
+## 11. Setup and Running the Application
 
 1. Ensure all required Python libraries are installed:
    ```
@@ -335,13 +373,13 @@ AI_CONFIG["claude"]["generate_func"] = anthropic_generate
    python convo.py
    ```
 
-## Error Handling and Logging
+## 12. Error Handling and Logging
 
 - Comprehensive error handling is implemented throughout the application.
 - Detailed logging is set up in `convo.py` and used across all files.
 - Logs are written to 'log/convo.log' for debugging and troubleshooting.
 
-## Extending the Application
+## 13. Extending the Application
 
 To add new features or AI personalities:
 
@@ -350,25 +388,25 @@ To add new features or AI personalities:
 3. Implement new command handlers in the AIConversationCLI class in `ai_conversation_cli.py`.
 4. Extend the ConversationManager class in `conversation_manager.py` for new conversation management features.
 
-## Testing
+## 14. Testing
 
 - Implement unit tests for individual components (e.g., ConversationManager methods, AIConversationCLI commands).
 - Create integration tests to ensure proper interaction between different modules.
 - Perform end-to-end testing of the entire conversation flow.
 
-## Performance Considerations
+## 15. Performance Considerations
 
 - The application uses asynchronous programming to handle concurrent operations efficiently.
 - Consider implementing caching mechanisms for frequently accessed data or AI responses.
 - Monitor and optimize AI model API usage to manage costs and improve response times.
 
-## Security Considerations
+## 16. Security Considerations
 
 - Ensure proper handling and storage of API keys and sensitive configuration data.
 - Implement input validation and sanitization to prevent potential security vulnerabilities.
 - Consider implementing user authentication if extending the application for multi-user scenarios.
 
-## Additional Notes
+## 17. Additional Notes
 
 - The application uses the `rich` library for enhanced console output, including colored text, panels, and progress spinners.
 - The `aioconsole` library is used for asynchronous console input, with a fallback to synchronous input if not available.
