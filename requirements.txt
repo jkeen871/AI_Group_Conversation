@@ -1,0 +1,12 @@
+PyQt5
+matplotlib
+scikit-learn
+numpy
+aiohttp
+tiktoken
+anthropic
+openai
+google-generativeai
+rich
+cmd2
+pygments

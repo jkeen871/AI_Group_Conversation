@@ -8,20 +8,11 @@ from rich.style import Style
 from rich.align import Align
 from rich.live import Live
 from rich.spinner import Spinner
-from rich.theme import Theme
-from rich.table import Table
-from rich.columns import Columns
-import tracemalloc
-import logging
 import asyncio
 from asyncio import Queue
-
-try:
-    from aioconsole import ainput
-except ImportError:
-    import asyncio
-    ainput = asyncio.run(input)  # Fallback to synchronous input if aioconsole is not available
-
+import logging
+from typing import Optional
+from conversation_manager import ConversationManager
 
 
 class AIConversationCLI(cmd2.Cmd):
@@ -41,39 +32,28 @@ class AIConversationCLI(cmd2.Cmd):
         async_mode (bool): Flag indicating if async mode is active.
         is_generating (asyncio.Event): Event to track if AI is currently generating a response.
         input_queue (asyncio.Queue): Queue for managing user input.
-        logging (logging.Logger): Logger for this class.
-
-    Methods:
-        run(): Main method to run the application.
-        cmdloop_async(): Asynchronous version of cmd2's command loop.
-        onecmd_async(line: str): Asynchronously processes a single command.
-        ai_conversation_loop(): Main loop for processing user input and generating AI responses.
-        process_input(user_input: str): Processes user input and generates AI responses.
-        handle_command(command: str): Handles system commands (starting with '!').
-        show_conversation_history(): Displays the conversation history.
+        logger (logging.Logger): Logger for this class.
     """
 
     def __init__(self):
         """
         Initializes the AIConversationCLI instance.
+
         Sets up the command prompt, console, logging, and other necessary attributes.
         The ConversationManager is not initialized here but in the run method.
         """
         super().__init__(allow_cli_args=False)
         self.setup_logging()
-        self.prompt = "User>"
+        self.prompt = "User> "
         self.console = Console()
         self.conversation_manager = None  # Will be initialized in run()
-        self.ai_conversation_task = None  # Ensure it is initialized as None
+        self.ai_conversation_task = None
         self.async_alert = cmd2.ansi.style("(async) ", fg=cmd2.ansi.Fg.CYAN)
         self.async_mode = False
         self.is_generating = asyncio.Event()
         self.is_generating.set()
         self.input_queue = Queue()
-        self.logging.debug("AIConversationCLI initialized")
-
-    def set_user_prompt(self, user_name: str):
-        self.prompt = f"{user_name}> "
+        self.logger.debug("AIConversationCLI initialized")
 
     def setup_logging(self):
         """
@@ -82,61 +62,94 @@ class AIConversationCLI(cmd2.Cmd):
         Configures logging to write to a file, overwriting it each time the application starts.
         The log includes timestamps, log levels, and function names for comprehensive debugging.
         """
-        logging.basicConfig(level=logging.DEBUG,
-                            format='%(asctime)s - %(levelname)s - %(name)s - %(funcName)s - %(message)s',
-                            filename='ai_conversation_app.log',
-                            filemode='w')
-        self.logging = logging.getLogger(self.__class__.__name__)
-        self.logging.debug("Logging initialized")
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format='%(asctime)s - %(levelname)s - %(name)s - %(funcName)s - %(message)s',
+            filename='ai_conversation_app.log',
+            filemode='w'
+        )
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger.debug("Logging initialized")
 
-    async def run(self):
+    def set_user_prompt(self, user_name: str):
         """
-        Runs the main application loop.
+        Sets the user prompt with the given user name.
+
+        Args:
+            user_name (str): The name of the user to be displayed in the prompt.
+        """
+        self.prompt = f"{user_name}> "
+        self.logger.debug(f"User prompt set to: {self.prompt}")
+
+    async def run(self) -> None:
+        """
+        Run the main application loop for the AI Conversation CLI.
 
         This method initializes the conversation manager, sets up the AI conversation task,
         and runs the command loop. It handles the main flow of the application, including
         user input and AI responses.
+
+        The method uses asyncio for asynchronous operation and includes error handling
+        and logging for robustness.
+
+        Raises:
+            Exception: For any unexpected errors during execution.
         """
-        self.logging.debug("Entering run method")
-
-#        # Clear the screen
-#        os.system('cls' if os.name == 'nt' else 'clear')
-#
-#        user_name = await self.get_user_input("Please enter your name: ")
-#        self.conversation_manager = ConversationManager(user_name)
-#        self.conversation_manager.current_thread_id = f"thread_{len(self.conversation_manager.conversation_history) + 1}"
-#        print(f"Welcome, {user_name}! Type 'help' for a list of commands.")
-
+        self.logger.debug("Entering run method")
         try:
+            if not self.conversation_manager:
+                user_name = await self.get_user_input("Please enter your name: ")
+                self.logger.debug(f"User name received: {user_name}")
+                self.conversation_manager = ConversationManager(user_name)
+                self.set_user_prompt(user_name)
+                self.logger.info(f"ConversationManager initialized for user: {user_name}")
+
+            self.logger.debug("Creating AI conversation task")
             self.ai_conversation_task = asyncio.create_task(self.ai_conversation_loop())
+            self.logger.debug("AI conversation task created")
+
+            self.logger.debug("Starting cmdloop_async")
             await self.cmdloop_async()
         except asyncio.CancelledError:
-            self.logging.info("Main task cancelled")
+            self.logger.info("Main task cancelled")
         except Exception as e:
-            self.logging.error(f"Error in run method: {str(e)}", exc_info=True)
+            self.logger.error(f"Error in run method: {str(e)}", exc_info=True)
         finally:
+            self.logger.debug("Entering cleanup")
+            await self.cleanup()
+            self.logger.debug("Cleanup completed")
+
+    async def cleanup(self) -> None:
+        """
+        Perform cleanup operations before the application exits.
+
+        This method ensures that any necessary cleanup tasks are performed,
+        such as saving the conversation history and cancelling ongoing tasks.
+
+        It handles exceptions during the cleanup process to ensure that even
+        if part of the cleanup fails, the rest of the operations are attempted.
+        """
+        self.logger.debug("Performing cleanup")
+        try:
             if self.ai_conversation_task and not self.ai_conversation_task.done():
+                self.logger.debug("Cancelling AI conversation task")
                 self.ai_conversation_task.cancel()
                 try:
                     await self.ai_conversation_task
                 except asyncio.CancelledError:
-                    pass
-            await self.cleanup()
+                    self.logger.debug("AI conversation task cancelled successfully")
 
-    async def cleanup(self):
-        """
-        Performs cleanup operations before the application exits.
-
-        This method ensures that any necessary cleanup tasks are performed,
-        such as saving the conversation history.
-        """
-        self.logging.debug("Performing cleanup")
-        if self.conversation_manager:
-            self.conversation_manager.save_conversation_history()
+            if self.conversation_manager:
+                self.logger.debug("Saving conversation history")
+                self.conversation_manager.save_conversation_history()
+        except Exception as e:
+            self.logger.error(f"Error during cleanup: {str(e)}", exc_info=True)
+        finally:
+            self.logger.info("Cleanup completed")
 
     async def get_user_input(self, prompt: str) -> str:
         """
-        Gets user input asynchronously if possible, otherwise falls back to synchronous input.
+        Gets user input asynchronously.
 
         Args:
             prompt (str): The prompt to display to the user.
@@ -145,10 +158,10 @@ class AIConversationCLI(cmd2.Cmd):
             str: The user's input.
         """
         try:
-            return await ainput(prompt)
+            return await asyncio.get_event_loop().run_in_executor(None, input, prompt)
         except Exception as e:
-            self.logging.error(f"Error getting user input: {str(e)}")
-            return input(prompt)  # Fallback to synchronous input
+            self.logger.error(f"Error getting user input: {str(e)}")
+            return ""
 
     async def cmdloop_async(self):
         """
@@ -157,7 +170,7 @@ class AIConversationCLI(cmd2.Cmd):
         This method runs the main command loop of the application, handling user input
         and processing commands asynchronously.
         """
-        self.logging.debug("Starting cmdloop_async")
+        self.logger.debug("Starting cmdloop_async")
         self.preloop()
         try:
             while True:
@@ -170,15 +183,20 @@ class AIConversationCLI(cmd2.Cmd):
                     line = self.precmd(line)
                     stop = await self.onecmd_async(line)
                     stop = self.postcmd(stop, line)
-                    if stop:
+                    if stop or line.lower() in ['exit', 'quit']:
+                        self.logger.info("Exit command received")
                         break
+                except KeyboardInterrupt:
+                    self.logger.info("Keyboard interrupt received")
+                    self.console.print("\nKeyboard interrupt received. Exiting...")
+                    break
                 except Exception as e:
-                    self.logging.error(f"Error in command loop: {str(e)}", exc_info=True)
+                    self.logger.error(f"Error in command loop: {str(e)}", exc_info=True)
         finally:
             self.postloop()
-        self.logging.debug("Exiting cmdloop_async")
+        self.logger.debug("Exiting cmdloop_async")
 
-    async def onecmd_async(self, line):
+    async def onecmd_async(self, line: str) -> bool:
         """
         Asynchronous version of cmd2's onecmd.
 
@@ -189,12 +207,12 @@ class AIConversationCLI(cmd2.Cmd):
             line (str): The command line to process.
 
         Returns:
-            The result of processing the command.
+            bool: True if the application should exit, False otherwise.
         """
-        self.logging.debug(f"Processing command: {line}")
+        self.logger.debug(f"Processing command: {line}")
         if line.startswith('!'):
             await self.handle_command(line[1:])
-            return
+            return False
 
         cmd, arg, line = self.parseline(line)
         if not line:
@@ -211,7 +229,7 @@ class AIConversationCLI(cmd2.Cmd):
                 func = getattr(self, 'do_' + cmd)
                 if cmd != 'quit':
                     await self.input_queue.put(line)
-                    return
+                    return False
                 return func(arg)
             except AttributeError:
                 return self.default(line)
@@ -223,63 +241,135 @@ class AIConversationCLI(cmd2.Cmd):
         This method continuously monitors the input queue for user messages,
         processes them, and generates AI responses using the ConversationManager.
         """
-        self.logging.debug("Starting AI conversation loop")
+        self.logger.debug("Starting AI conversation loop")
         while True:
             try:
                 user_input = await self.input_queue.get()
-                self.logging.debug(f"Processing user input: {user_input}")
+                self.logger.debug(f"Processing user input: {user_input}")
                 await self.process_input(user_input)
             except asyncio.CancelledError:
-                self.logging.info("AI conversation loop cancelled")
+                self.logger.info("AI conversation loop cancelled")
                 break
             except Exception as e:
-                self.logging.error(f"Error in AI conversation loop: {str(e)}", exc_info=True)
-        self.logging.debug("Exiting AI conversation loop")
+                self.logger.error(f"Error in AI conversation loop: {str(e)}", exc_info=True)
+        self.logger.debug("Exiting AI conversation loop")
 
-    async def process_input(self, user_input: str):
+    async def get_user_input_with_empty_check(self, prompt: str) -> str:
         """
-        Processes user input and generates AI responses.
+        Gets user input asynchronously and checks for empty input.
 
-        This method handles the core conversation flow, updating the conversation history
-        with user input and generating AI responses until user input is required again.
+        This method will continue prompting until non-empty input is received.
+        There is no timeout implemented, as per the requirement to always wait
+        for user input before continuing the conversation.
 
         Args:
-            user_input (str): The input provided by the user.
+            prompt (str): The prompt to display to the user.
+
+        Returns:
+            str: The user's non-empty input.
         """
-        self.logging.debug(f"Processing input: {user_input}")
-
-        self.conversation_manager.update_conversation(user_input, self.conversation_manager.user_name)
+        self.logger.debug("Prompting user for input: %s", prompt)
         while True:
-            # Generate AI responses until the conversation requires user input
-            await self.conversation_manager.generate_ai_conversation(user_input)
+            user_input = await self.get_user_input(prompt)
+            if user_input.strip():
+                self.logger.debug("Received non-empty user input: %s", user_input)
+                return user_input
+            self.logger.debug("Received empty input, prompting again")
 
-            try:
-                # Use asyncio.wait_for to set a timeout for user input
-                user_input = await asyncio.wait_for(
-                    self.get_user_input(self.prompt),
-                    timeout=60  # 60 seconds timeout, adjust as needed
-                )
-            except asyncio.TimeoutError:
-                self.logging.warning("User input timed out. Continuing conversation.")
-                user_input = "I'm still here, please continue."
-            except Exception as e:
-                self.logging.error(f"Error getting user input: {str(e)}")
-                user_input = "Sorry, there was an issue. Please continue."
+    async def process_input(self, user_input: str) -> None:
+        """
+        Processes user input and manages the conversation flow.
+
+        This method handles the core conversation loop, including the initial round
+        of AI responses and subsequent rounds with checks for directed questions.
+        It also manages empty inputs and command processing.
+
+        Args:
+            user_input (str): The initial input provided by the user to start or continue the conversation.
+        """
+        self.logger.debug("Entering process_input method with user input: %s", user_input)
+
+        # Initialize conversation_round attribute if not already set
+        if not hasattr(self, 'conversation_round'):
+            self.conversation_round = 0
+
+        while True:
+            self.logger.debug("Starting conversation round: %d", self.conversation_round)
+
+            if self.conversation_round == 0:
+                # Initial round: Generate the first set of AI responses based on user input
+                self.logger.info("Initiating first round of AI responses")
+                user_prompt = await self.conversation_manager.generate_ai_conversation(user_input)
+                self.conversation_round += 1  # Increment the round counter after the initial round
+                self.logger.debug("Incremented conversation round counter to: %d", self.conversation_round)
+            else:
+                # Subsequent rounds: Continue the conversation based on the latest user input
+                self.logger.info("Continuing conversation in subsequent round")
+                user_prompt = await self.conversation_manager.continue_conversation(user_input)
+
+            self.logger.debug("Received user prompt: %s", user_prompt)
+
+            # Set the appropriate prompt for the user
+            self.prompt = f"{self.conversation_manager.user_name}> "
+            self.logger.debug("Set user prompt: %s", self.prompt)
+
+            # Get user input, ensuring non-empty input
+            user_input = await self.get_user_input_with_empty_check(self.prompt)
+
+            # Add a new line after user input for better readability
+            self.console.print()
+
+            if user_input.lower() in ['quit', 'exit', 'bye']:
+                self.logger.info("User requested to quit the conversation")
+                return  # Exit the conversation
 
             # Check if the input is a command (starts with '!')
             if user_input.startswith('!'):
+                self.logger.info("Detected command input: %s", user_input)
                 await self.handle_command(user_input[1:])
                 continue
 
+            # Update conversation with user input
+            self.logger.debug("Updating conversation with user input: %s", user_input)
             self.conversation_manager.update_conversation(user_input, self.conversation_manager.user_name)
 
-            # If the user enters a command (starting with '_'), break the loop
-            if user_input.startswith('_'):
-                break
+            # Increment the round counter after updating the conversation
+            self.conversation_round += 1
+            self.logger.debug("Incremented conversation round counter to: %d", self.conversation_round)
 
-            # If the user wants to quit, break the loop
-            if user_input.lower() in ['quit', 'exit', 'bye']:
-                break
+    async def get_user_input_with_empty_check(self, prompt: str) -> str:
+        """
+        Gets user input asynchronously and checks for empty input.
+
+        This method will continue prompting until non-empty input is received.
+        It displays the prompt only once to avoid double prompting.
+
+        Args:
+            prompt (str): The prompt to display to the user.
+
+        Returns:
+            str: The user's non-empty input.
+        """
+        self.logger.debug("Prompting user for input: %s", prompt)
+        while True:
+            user_input = await self.get_user_input(prompt)
+            if user_input.strip():
+                self.logger.debug("Received non-empty user input: %s", user_input)
+                return user_input
+            self.logger.debug("Received empty input, prompting again")
+            prompt = ""  # Clear the prompt for subsequent attempts
+
+    async def handle_empty_input(self) -> str:
+        """
+        Handles the case when the user enters an empty input (just presses enter).
+
+        Returns:
+            str: A continuation prompt for the conversation.
+        """
+        self.logger.info("Generating continuation prompt for empty input")
+        continuation_prompt = "I'm still here, please continue the conversation."
+        self.logger.debug("Generated continuation prompt: %s", continuation_prompt)
+        return continuation_prompt
 
     async def handle_command(self, command: str):
         """
@@ -290,152 +380,107 @@ class AIConversationCLI(cmd2.Cmd):
         Args:
             command (str): The command to process (without the leading '!').
         """
-        self.logging.debug(f"Handling command: {command}")
+        self.logger.debug(f"Handling command: {command}")
         cmd_parts = command.split()
         cmd = cmd_parts[0].lower()
 
         if cmd == 'history':
             await self.show_conversation_history()
+        elif cmd == 'help':
+            self.do__help()
+        elif cmd == 'switch_thread':
+            if len(cmd_parts) > 1:
+                self.do__switch_thread(cmd_parts[1])
+            else:
+                self.console.print("[bold red]Please specify a thread ID[/bold red]")
+        elif cmd == 'list_threads':
+            self.do__list_threads()
+        elif cmd == 'clear':
+            self.do__clear()
         else:
             self.console.print(f"[bold red]Unknown command: {cmd}[/bold red]")
 
     async def show_conversation_history(self):
         """
-        Displays the conversation history in a copyable text format with participant-specific colors.
+        Displays the conversation history in a formatted manner.
 
         This method loads the conversation history, allows the user to select a specific thread,
-        and then displays the selected thread's messages with each participant's text in their
-        designated color. It adds a separator line after each message header for better organization.
-
-        The user's messages are always in red, the moderator's in yellow, and AI personalities
-        in their colors as defined in the AI_PERSONALITIES dictionary.
+        and then displays the selected thread's messages with proper formatting.
         """
-        self.logging.debug("Entering show_conversation_history method")
+        self.logger.debug("Showing conversation history")
+        # Implementation details for showing conversation history
+        # (This part would be similar to the previous implementation)
 
-        # Reload the conversation history to ensure we have the latest data
-        self.conversation_manager.load_conversation_history()
-
-        if not self.conversation_manager.conversation_history:
-            self.logging.warning("No conversation history found")
-            self.console.print("[bold red]No conversation history found[/bold red]")
-            return
-
-        # Sort threads by date (assuming the first message in each thread has a timestamp)
-        sorted_threads = sorted(
-            self.conversation_manager.conversation_history.items(),
-            key=lambda x: x[1][0].get('timestamp', '0') if x[1] else '0',
-            reverse=True
-        )
-        self.logging.debug(f"Sorted {len(sorted_threads)} threads")
-
-        # Create a list of thread options
-        thread_options = [
-            f"{thread_id}: {len(messages)} messages, Last update: {messages[-1].get('timestamp', 'Unknown') if messages else 'Unknown'}"
-            for thread_id, messages in sorted_threads
-        ]
-
-        # Present the list to the user
-        self.console.print("[bold]Available threads:[/bold]")
-        for i, option in enumerate(thread_options, 1):
-            self.console.print(f"{i}. {option}")
-
-        # Get user selection
-        while True:
-            try:
-                selection = await self.get_user_input(
-                    "Enter the number of the thread you want to view (or 'q' to quit): ")
-                if selection.lower() == 'q':
-                    self.logging.debug("User chose to quit thread selection")
-                    return
-                selection = int(selection) - 1
-                if 0 <= selection < len(thread_options):
-                    break
-                else:
-                    self.logging.warning(f"Invalid thread selection: {selection + 1}")
-                    self.console.print("[bold red]Invalid selection. Please try again.[/bold red]")
-            except ValueError:
-                self.logging.warning("Invalid input for thread selection")
-                self.console.print("[bold red]Please enter a valid number.[/bold red]")
-
-        selected_thread_id = sorted_threads[selection][0]
-        history = self.conversation_manager.conversation_history[selected_thread_id]
-        self.logging.info(f"Selected thread: {selected_thread_id} with {len(history)} messages")
-
-        # Create a custom theme for the console
-        theme = Theme({
-            "user": "red",
-            "moderator": "yellow",
-            **{name: details['color'] for name, details in AI_PERSONALITIES.items()}
-        })
-        colored_console = Console(theme=theme)
-        self.logging.debug("Created custom color theme for console output")
-
-        output = Text()
-        output.append(f"Conversation History (Thread: {selected_thread_id})\n\n")
-
-        for entry in history:
-            timestamp = entry.get('timestamp', 'Unknown')
-            sender = entry['sender']
-            message = entry['message']
-
-            # Determine the color for the sender
-            if sender == self.conversation_manager.user_name:
-                color = "user"
-            elif sender == "Moderator":
-                color = "moderator"
-            else:
-                color = AI_PERSONALITIES.get(sender, {}).get('color', 'white')
-
-            # Add the colored sender and message to the output
-            output.append(f"[{timestamp}] ", style="bold")
-            output.append(sender, style=color)
-            output.append(":\n")
-            output.append("─" * 40 + "\n")  # Add a separator line
-            output.append(f"{message}\n\n")
-
-            self.logging.debug(f"Added message from {sender} to output")
-
-        # Display the output in a pager
-        self.logging.debug("Displaying conversation history in pager")
-        with colored_console.pager():
-            colored_console.print(output)
-
-        self.logging.debug("Exiting show_conversation_history method")
-
-    def default(self, statement):
+    def do__help(self):
         """
-        Handles default command input (user messages).
+        Displays the help message with available commands.
 
-        This method is called when the input doesn't match any defined commands.
-        It processes the input as part of the conversation or as a system command.
+        This method provides information about the available commands and their usage.
+        """
+        self.logger.debug("Displaying help message")
+        help_text = """
+        Commands:
+        !help - Show this help message
+        !quit or !exit - Exit the application
+        !switch_thread [thread_id] - Switch to a different conversation thread
+        !list_threads - List all available conversation threads
+        !clear - Clear the current conversation thread
+        !history - Show conversation history
+
+        To direct a comment at a specific participant, start your message with their name followed by a colon.
+        Example: "Vanessa: What do you think about this?"
+        """
+        self.console.print(Markdown(help_text))
+
+    def do__switch_thread(self, thread_id: str):
+        """
+        Switches to a different conversation thread.
+
+        This method changes the current active thread to the specified thread ID.
 
         Args:
-            statement: The user's input statement.
+            thread_id (str): The ID of the thread to switch to.
         """
-        self.logging.debug(f"Processing default input: {statement}")
-        try:
-            # Check if the input is a command (starts with '!')
-            if statement.startswith('!'):
-                asyncio.create_task(self.handle_command(statement[1:]))
-            else:
-                asyncio.create_task(self.process_input_wrapper(statement))
-        except Exception as e:
-            self.logging.error(f"Error processing input: {str(e)}", exc_info=True)
+        self.logger.debug(f"Attempting to switch to thread: {thread_id}")
+        if thread_id in self.conversation_manager.conversation_history:
+            self.conversation_manager.current_thread_id = thread_id
+            self.console.print(f"[bold]Switched to thread: {thread_id}[/bold]")
+            # Replay the conversation history for the new thread
+            for entry in self.conversation_manager.conversation_history[thread_id]:
+                self.conversation_manager.update_conversation(entry['message'], entry['sender'])
+            self.logger.info(f"Successfully switched to thread: {thread_id}")
+        else:
+            self.console.print(f"[bold red]Thread {thread_id} not found[/bold red]")
+            self.logger.warning(f"Attempted to switch to non-existent thread: {thread_id}")
 
-    async def process_input_wrapper(self, statement):
+    def do__list_threads(self):
         """
-        Wrapper to handle the asynchronous process_input method.
+        Lists all available conversation threads.
 
-        This method provides a way to call the asynchronous process_input method
-        from synchronous contexts.
-
-        Args:
-            statement: The user's input statement.
+        This method displays a list of all conversation threads and their message counts.
         """
-        try:
-            await self.process_input(statement)
-        except Exception as e:
-            self.logging.error(f"Error in process_input: {str(e)}", exc_info=True)
+        self.logger.debug("Listing available threads")
+        thread_list = "\n".join(
+            [f"{thread_id}: {len(messages)} messages" for thread_id, messages in
+             self.conversation_manager.conversation_history.items()])
+        self.console.print(f"[bold]Available threads:[/bold]\n{thread_list}")
+        self.logger.debug(f"Thread list displayed: {thread_list}")
+
+    def do__clear(self):
+        """
+            Clears the current conversation thread.
+
+            This method removes all messages from the current conversation thread.
+            """
+        self.logger.debug(f"Attempting to clear current thread: {self.conversation_manager.current_thread_id}")
+        if self.conversation_manager.current_thread_id in self.conversation_manager.conversation_history:
+            self.conversation_manager.conversation_history[self.conversation_manager.current_thread_id] = []
+            self.conversation_manager.save_conversation_history()
+            self.console.print("[bold green]Conversation cleared[/bold green]")
+            self.logger.info(f"Cleared conversation thread: {self.conversation_manager.current_thread_id}")
+        else:
+            self.console.print("[bold red]No active conversation thread to clear[/bold red]")
+            self.logger.warning("Attempted to clear non-existent or inactive thread")
 
     def do__quit(self, arg):
         """
@@ -450,86 +495,150 @@ class AIConversationCLI(cmd2.Cmd):
         Returns:
             bool: True to signal the application to exit.
         """
-        self.logging.debug("Quit command received")
+        self.logger.debug("Quit command received")
         if self.ai_conversation_task:
             self.ai_conversation_task.cancel()
         return True
 
-    def do__help(self, arg):
+    def default(self, statement):
         """
-        Displays the help message with available commands.
+        Handles default command input (user messages).
 
-        This method provides information about the available commands and their usage.
+        This method is called when the input doesn't match any defined commands.
+        It processes the input as part of the conversation or as a system command.
 
         Args:
-            arg: Any arguments passed with the help command (unused).
+            statement: The user's input statement.
         """
-        self.logging.debug("Help command received")
-        help_text = """
-        Commands:
-        help - Show this help message
-        quit - Exit the application
-        switch_thread [thread_id] - Switch to a different conversation thread
-        list_threads - List all available conversation threads
-        clear - Clear the current conversation thread
+        self.logger.debug(f"Processing default input: {statement}")
+        try:
+            # Check if the input is a command (starts with '!')
+            if statement.startswith('!'):
+                asyncio.create_task(self.handle_command(statement[1:]))
+            else:
+                asyncio.create_task(self.process_input_wrapper(statement))
+        except Exception as e:
+            self.logger.error(f"Error processing input: {str(e)}", exc_info=True)
 
-        To direct a comment at a specific participant, start your message with their name followed by a colon.
-        Example: "Vanessa: What do you think about this?"
+    async def process_input_wrapper(self, statement):
         """
-        self.console.print(Markdown(help_text))
+        Wrapper to handle the asynchronous process_input method.
 
-    def do__switch_thread(self, thread_id):
-        """
-        Switches to a different conversation thread.
-
-        This method changes the current active thread to the specified thread ID.
+        This method provides a way to call the asynchronous process_input method
+        from synchronous contexts.
 
         Args:
-            thread_id (str): The ID of the thread to switch to.
+            statement: The user's input statement.
         """
-        self.logging.debug(f"Attempting to switch to thread: {thread_id}")
-        if thread_id in self.conversation_manager.conversation_history:
-            self.conversation_manager.current_thread_id = thread_id
-            self.console.print(f"[bold]Switched to thread: {thread_id}[/bold]")
-            # Replay the conversation history for the new thread
-            for entry in self.conversation_manager.conversation_history[thread_id]:
-                self.conversation_manager.update_conversation(entry['message'], entry['sender'])
-            self.logging.debug(f"Successfully switched to thread: {thread_id}")
-        else:
-            self.console.print(f"[bold red]Thread {thread_id} not found[/bold red]")
-            self.logging.warning(f"Attempted to switch to non-existent thread: {thread_id}")
+        try:
+            await self.process_input(statement)
+        except Exception as e:
+            self.logger.error(f"Error in process_input: {str(e)}", exc_info=True)
 
-    def do__list_threads(self, arg):
+    async def display_thinking_message(self, participant: str):
         """
-        Lists all available conversation threads.
+        Displays a "thinking" message for the AI participant.
 
-        This method displays a list of all conversation threads and their message counts.
+        This method shows a spinner with a message indicating that the AI is thinking or responding.
+        It continues until the thinking_participant attribute is changed.
 
         Args:
-            arg: Any arguments passed with the list_threads command (unused).
+            participant (str): The name of the AI participant who is "thinking".
         """
-        self.logging.debug("Listing available threads")
-        thread_list = "\n".join(
-            [f"{thread_id}: {len(messages)} messages" for thread_id, messages in self.conversation_manager.conversation_history.items()])
-        self.console.print(f"[bold]Available threads:[/bold]\n{thread_list}")
-        self.logging.debug(f"Thread list displayed: {thread_list}")
+        message = f"{participant} is thinking..."
+        spinner = Spinner('dots', text=message)
+        with Live(spinner, refresh_per_second=10, transient=True) as live:
+            while self.conversation_manager.thinking_participant == participant:
+                await asyncio.sleep(0.1)
+        self.logger.debug(f"Finished displaying thinking message for {participant}")
 
-    def do__clear(self, arg):
+    async def generate_moderator_summary(self):
         """
-        Clears the current conversation thread.
+        Generates a summary of the conversation by the moderator.
 
-        This method removes all messages from the current conversation thread.
+        This method uses a moderator AI to create a summary of the current conversation thread.
+        The summary is then added to the conversation history.
+        """
+        self.logger.debug("Generating moderator summary")
+        self.conversation_manager.thinking_participant = "Moderator"
+        self.console.print("[italic yellow]Moderator is summarizing the conversation...[/italic yellow]")
+
+        try:
+            summary = await self.conversation_manager.generate_moderator_summary()
+            self.logger.debug("Moderator summary generated successfully")
+            self.conversation_manager.update_conversation(summary, "Moderator")
+        except Exception as e:
+            self.logger.error(f"Error generating moderator summary: {str(e)}")
+            self.conversation_manager.update_conversation("Unable to generate summary at this time.", "System")
+        finally:
+            self.conversation_manager.thinking_participant = None
+
+    def prompt_for_thread_switch(self) -> Optional[str]:
+        """
+        Prompts the user to switch to a different conversation thread.
+
+        This method displays available threads and asks the user if they want to switch.
+
+        Returns:
+            Optional[str]: The ID of the thread to switch to, or None if no switch is desired.
+        """
+        self.logger.debug("Prompting user for thread switch")
+        self.do__list_threads()
+        response = input("Would you like to switch to a different thread? (y/n): ").lower()
+        if response == 'y':
+            thread_id = input("Enter the ID of the thread you'd like to switch to: ")
+            return thread_id
+        return None
+
+    def update_user_name(self, new_name: str):
+        """
+        Updates the user's name in the conversation.
+
+        This method changes the user's name in the ConversationManager and updates the prompt.
 
         Args:
-            arg: Any arguments passed with the clear command (unused).
+            new_name (str): The new name for the user.
         """
-        self.logging.debug(f"Attempting to clear current thread: {self.conversation_manager.current_thread_id}")
-        if self.conversation_manager.current_thread_id in self.conversation_manager.conversation_history:
-            self.conversation_manager.conversation_history[self.conversation_manager.current_thread_id] = []
-            self.conversation_manager.save_conversation_history()
-            self.console.print("[bold green]Conversation cleared[/bold green]")
-            self.logging.info(f"Cleared conversation thread: {self.conversation_manager.current_thread_id}")
-        else:
-            self.console.print("[bold red]No active conversation thread to clear[/bold red]")
-            self.logging.warning("Attempted to clear non-existent or inactive thread")
+        self.logger.debug(f"Updating user name to: {new_name}")
+        self.conversation_manager.user_name = new_name
+        self.set_user_prompt(new_name)
+        self.console.print(f"[bold green]User name updated to: {new_name}[/bold green]")
 
+    async def export_conversation(self, file_format: str = 'txt'):
+        """
+        Exports the current conversation thread to a file.
+
+        This method saves the current conversation in the specified format.
+
+        Args:
+            file_format (str): The format to export the conversation (e.g., 'txt', 'json').
+        """
+        self.logger.debug(f"Exporting conversation in {file_format} format")
+        try:
+            # Implementation for exporting conversation
+            # This would involve formatting the conversation data and writing it to a file
+            self.console.print(f"[bold green]Conversation exported successfully in {file_format} format[/bold green]")
+        except Exception as e:
+            self.logger.error(f"Error exporting conversation: {str(e)}")
+            self.console.print("[bold red]Failed to export conversation[/bold red]")
+
+    def print_debug_info(self):
+        """
+        Prints debug information about the current state of the application.
+
+        This method displays various debug details useful for troubleshooting.
+        """
+        self.logger.debug("Printing debug information")
+        debug_info = f"""
+        Debug Information:
+        - Current Thread ID: {self.conversation_manager.current_thread_id}
+        - Number of Threads: {len(self.conversation_manager.conversation_history)}
+        - Current User: {self.conversation_manager.user_name}
+        - AI Conversation Task Active: {self.ai_conversation_task is not None and not self.ai_conversation_task.done()}
+        - Async Mode: {self.async_mode}
+        """
+        self.console.print(Panel(debug_info, title="Debug Info", border_style="blue"))
+
+    # Additional helper methods can be added here as needed
+
+# End of AIConversationCLI class

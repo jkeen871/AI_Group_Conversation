@@ -1,273 +1,279 @@
-import cmd2
-from rich.console import Console
-from rich.markdown import Markdown
-from rich.syntax import Syntax
-from rich.panel import Panel
-from rich.text import Text
-from rich.style import Style
-from rich.align import Align
-from rich.live import Live
-from rich.spinner import Spinner
-from rich.theme import Theme
-from rich.table import Table
-from rich.columns import Columns
-import tracemalloc
-
-from itertools import cycle
-import asyncio
-from asyncio import Queue
-import os
-import random
-import json
-import re
 import logging
-from typing import Dict, Any, List, AsyncGenerator
-from personalities import AI_PERSONALITIES, HELPER_PERSONALITIES, MASTER_SYSTEM_MESSAGE
+import json
+import random
+import asyncio
+from datetime import datetime
+from typing import Dict, List, AsyncGenerator, Optional, Union, Tuple
+from PyQt5.QtCore import QObject, pyqtSignal
+import aiohttp
+import tiktoken
+import re
+from schema import ConversationHistory, ConversationThread, MessageEntry
 from ai_config import AI_CONFIG, log_ai_error
+from personalities import AI_PERSONALITIES, HELPER_PERSONALITIES, MASTER_SYSTEM_MESSAGE, USER_IDENTITY
+from ConversationRAG import ConversationRAG
+from Visualizer import VectorGraphVisualizer
 
-# Import ainput or define a fallback
-try:
-    from aioconsole import ainput
-except ImportError:
-    import asyncio
-    ainput = asyncio.run(input)  # Fallback to synchronous input if aioconsole is not available
 
-class ConversationManager:
-    """
-    Manages the conversation history, AI interactions, and related operations.
+class ConversationManager(QObject):
+    ai_thinking_started = pyqtSignal(str)
+    ai_thinking_finished = pyqtSignal(str)
+    token_usage_updated = pyqtSignal(int)
+    user_identity_loaded = pyqtSignal(str)
+    ai_response_generated = pyqtSignal(str, str, str, str)
 
-    This class is responsible for maintaining the conversation history, generating AI responses,
-    and handling the core logic of the conversation flow. It interacts with various AI models
-    and personalities to create a dynamic conversational experience.
-
-    Attributes:
-        conversation_history (Dict[str, List[Dict]]): A dictionary storing conversation threads.
-        current_thread_id (str): The ID of the current active conversation thread.
-        user_name (str): The name of the human user participating in the conversation.
-        CONVERSATION_HISTORY_FILE (str): The file path for storing conversation history.
-        thinking_participant (str): The name of the AI participant currently "thinking".
-        participants (List[str]): A list of AI participants in the conversation.
-        last_addressed (str): The last participant addressed in the conversation.
-        console (Console): A Rich console object for formatted output.
-        logging (logging.Logger): A logger for debug and error messages.
-
-    Methods:
-        load_conversation_history(): Loads the conversation history from a file.
-        save_conversation_history(): Saves the current conversation history to a file.
-        update_conversation(message: str, sender: str): Adds a new message to the conversation history.
-        format_and_print_message(message: str, sender: str): Formats and prints a message.
-        get_conversation_context(): Retrieves the current conversation context.
-        generate_ai_response(prompt: str, participant: str): Generates an AI response.
-        extract_ai_response(full_response: str, participant: str): Extracts AI response from full text.
-        generate_single_response(participant: str, prompt: str, responding_to: str): Generates a single AI response.
-        detect_addressed_participant(message: str): Detects which participant a message is addressed to.
-        randomize_participants(): Randomizes the order of AI participants.
-        generate_ai_conversation(prompt: str): Generates a full AI conversation based on a prompt.
-        generate_moderator_summary(): Generates a summary of the conversation by a moderator AI.
-    """
-
-    def __init__(self, user_name: str):
-        """
-        Initializes the ConversationManager with necessary attributes and loads conversation history.
-
-        Args:
-            user_name (str): The name of the human user participating in the conversation.
-        """
-        self.conversation_history = {}
-        self.current_thread_id = ""
-        self.user_name = user_name
-        self.CONVERSATION_HISTORY_FILE = "conversation_history.json"
-        self.thinking_participant = None
-        self.participants = list(AI_PERSONALITIES.keys())
-        self.last_addressed = None
-        self.console = Console()
-        self.logging = logging.getLogger(self.__class__.__name__)
-
+    def __init__(self, user_name: str, is_gui: bool = False):
+        super().__init__()
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.user_name: str = user_name
+        self.is_gui: bool = is_gui
+        self.conversation_history: ConversationHistory = {}
+        self.current_thread_id: str = ""
+        self.CONVERSATION_HISTORY_FILE: str = "conversation_history.json"
+        self.thinking_participant: Optional[str] = None
+        self.participants: List[str] = list(AI_PERSONALITIES.keys())
+        self.last_addressed: Optional[str] = None
+        self.rag = ConversationRAG()
+        self.visualizer = None
+        self.console = None
+        self.used_rag: bool = False
+        self.context_token_count: int = 0
+        self.response_token_count: int = 0
+        self.total_tokens: int = 0
+        self.is_interrupted = False
+        self.cl100k_tokenizer = tiktoken.get_encoding("cl100k_base")
+        self.p50k_tokenizer = tiktoken.get_encoding("p50k_base")
+        self.active_participants: List[str] = []
+        self.responded_participants: Set[str] = set()  # New: Track responded participants
         self.load_conversation_history()
-        self.logging.debug("ConversationManager initialized")
+        self.new_topic()
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.current_round: int = 0  # Add this line
 
-    def load_conversation_history(self):
-        """
-        Loads the conversation history from a JSON file.
+        self.logger.debug("ConversationManager initialization complete")
 
-        If the file doesn't exist or is invalid, initializes an empty history.
-        The conversation history is stored in self.conversation_history.
+    def set_active_participants(self, participants: List[str]):
+        self.active_participants = participants
+        self.logger.info(f"Active participants set to: {self.active_participants}")
+
+    def interrupt(self):
+        self.is_interrupted = True
+        self.logger.info("Conversation interrupted")
+
+    def reset_interrupt(self):
+        self.is_interrupted = False
+        self.logger.info("Interrupt flag reset")
+
+    async def create_session(self):
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession()
+            self.logger.debug("Created new aiohttp ClientSession")
+
+    async def close_session(self):
+        if self.session and not self.session.closed:
+            await self.session.close()
+            self.logger.debug("Closed aiohttp ClientSession")
+
+    def load_user_identity(self):
         """
+        Load or create user identity and emit greeting.
+        """
+        self.logger.debug(f"Loading user identity for {self.user_name}")
+        if self.user_name in USER_IDENTITY:
+            greeting = USER_IDENTITY[self.user_name]["greeting"]
+            self.logger.info(f"User {self.user_name} found in USER_IDENTITY")
+        else:
+            greeting = f"Welcome, {self.user_name}!"
+            USER_IDENTITY[self.user_name] = {'greeting': greeting}
+            self.logger.info(f"Added {self.user_name} to USER_IDENTITY")
+
+        self.user_identity_loaded.emit(greeting)
+
+    def load_conversation_history(self) -> None:
         try:
             with open(self.CONVERSATION_HISTORY_FILE, "r") as file:
-                self.conversation_history = json.load(file)
-            self.logging.debug(f"Loaded conversation history from {self.CONVERSATION_HISTORY_FILE}")
+                loaded_history = json.load(file)
+
+            self.conversation_history = {
+                thread_id: ConversationThread.from_dict(thread_data)
+                for thread_id, thread_data in loaded_history.items()
+            }
+
+            self.logger.debug(f"Loaded conversation history from {self.CONVERSATION_HISTORY_FILE}")
         except (FileNotFoundError, json.JSONDecodeError):
             self.conversation_history = {}
-            self.logging.debug(f"Conversation history file not found or invalid. Starting with an empty history.")
+            self.logger.warning("Conversation history file not found or invalid. Starting with an empty history.")
 
-    def save_conversation_history(self):
-        """
-        Saves the current conversation history to a JSON file.
-
-        The conversation history is saved to the file specified by CONVERSATION_HISTORY_FILE.
-        This method should be called after any updates to the conversation history.
-        """
+    def save_conversation_history(self) -> None:
         try:
+            history_dict = {
+                thread_id: thread.to_dict()
+                for thread_id, thread in self.conversation_history.items()
+            }
             with open(self.CONVERSATION_HISTORY_FILE, 'w') as file:
-                json.dump(self.conversation_history, file, indent=2)
-            self.logging.debug(f"Saved conversation history to {self.CONVERSATION_HISTORY_FILE}")
+                json.dump(history_dict, file, indent=2, default=str)
+            self.logger.debug(f"Saved conversation history to {self.CONVERSATION_HISTORY_FILE}")
         except Exception as e:
-            self.logging.error(f"Error occurred while saving conversation history: {str(e)}")
+            self.logger.error(f"Error occurred while saving conversation history: {str(e)}", exc_info=True)
 
-    def update_conversation(self, message: str, sender: str = "User"):
-        """
-        Updates the conversation history with a new message and displays it.
-
-        This method adds a new message to the current conversation thread and saves the updated history.
-        It also formats and prints the message to the console.
-
-        Args:
-            message (str): The content of the message to be added.
-            sender (str): The name of the message sender. Defaults to "User".
-        """
-        self.logging.debug(f"Updating conversation with message from {sender}")
-        if self.current_thread_id not in self.conversation_history:
-            self.conversation_history[self.current_thread_id] = []
-
-        self.conversation_history[self.current_thread_id].append({
-            "sender": sender,
-            "message": message,
-            "is_partial": False,
-            "is_divider": False
-        })
-        self.save_conversation_history()
-
-        self.format_and_print_message(message, sender)
-
-    def format_and_print_message(self, message: str, sender: str):
-        """
-        Formats and prints a message with the sender's color as background and black text.
-
-        This method applies specific formatting to the message based on the sender:
-        - Participant names mentioned in the message are highlighted.
-        - The AI model used is displayed in the title after the sender's name.
-        - Messages are displayed in colored panels aligned to the left or right.
-
-        Args:
-            message (str): The message content to format and print.
-            sender (str): The name of the message sender.
-        """
-        self.logging.debug(f"Formatting message from {sender}")
-
-        if sender == "Moderator":
-            sender_color = "yellow"
-            model = AI_CONFIG.get("anthropic", {}).get("model", "")  # Assuming Moderator uses Anthropic
-        elif sender == self.user_name:
-            sender_color = "red"
-            model = ""  # No model for human user
+    def update_conversation_topic(self, topic: str):
+        if self.current_thread_id in self.conversation_history:
+            self.conversation_history[self.current_thread_id].topic = topic
+            self.save_conversation_history()
+            self.logger.info(f"Updated conversation topic: {topic}")
+            # Emit a signal or update the GUI to display the new topic
+            # if self.is_gui:
+            #    self.ai_response_generated.emit("System", f"The topic of this conversation has been set to: {topic}",
+            #                                    "System", "System")
         else:
-            ai_personality = AI_PERSONALITIES.get(sender, {})
-            sender_color = ai_personality.get('color', 'white')
-            ai_name = ai_personality.get('ai_name', '')
-            model = AI_CONFIG.get(ai_name, {}).get("model", "")
+            self.logger.error("Cannot update topic: No active conversation thread")
 
-        console = Console()
+    def update_conversation(self, message: str, sender: str = "User", ai_name: str = None, model: str = None) -> None:
+        self.logger.debug(f"Updating conversation with message from {sender}")
 
-        lines = message.split('\n')
-        current_panel_content = Text()
-        in_code_block = False
-        code_block = []
-        code_lang = ""
+        if self.current_thread_id not in self.conversation_history:
+            self.new_topic()
 
-        def print_current_panel():
-            if current_panel_content:
-                if sender != self.user_name:
-                    panel_style = Style(color="black", bgcolor=sender_color)
-                    title = f"{sender} [{model}]" if model else sender
-                    message_panel = Panel(
-                        current_panel_content,
-                        title=Text(title, style=panel_style),
-                        border_style=panel_style,
-                        expand=False,
-                        style=panel_style,
-                        width=console.width - 5  # Limit the width of the participant's comment windows
-                    )
-                    # Align the whole box to the right, but keep text left-aligned
-                    console.print(Align.right(message_panel))
-                else:
-                    panel = Panel(
-                        current_panel_content,
-                        title=Text(sender, style=Style(color="black", bold=True)),
-                        border_style=Style(color="black"),
-                        expand=False,
-                        style=Style(color="black", bgcolor=sender_color)
-                    )
-                    # Align the user's box to the left
-                    console.print(panel)
+        # Skip System messages
+        if sender.lower() == "system":
+            self.logger.debug("Skipping System message")
+            return
 
-        # Print any remaining content
-        print_current_panel()
-        console.print("")  # single line between responses
+        new_entry = MessageEntry(
+            sender=sender,
+            message=message,
+            ai_name=ai_name,
+            model=model,
+            is_partial=False,
+            is_divider=False,
+            timestamp=datetime.now().isoformat()
+        )
 
-        self.logging.debug("Message formatted and printed successfully")
+        # Check for duplicates
+        messages = self.conversation_history[self.current_thread_id].messages
+        if not messages or new_entry != messages[-1]:
+            messages.append(new_entry)
+            self.save_conversation_history()
 
-        for line in lines:
-            if line.startswith('```'):
-                if in_code_block:
-                    # End of code block
-                    print_current_panel()
-                    current_panel_content = Text()
+            # Update the RAG database
+            try:
+                self.rag.add_message(f"{sender}: {message}")
+                self.logger.debug("RAG system updated with new message")
+                if self.visualizer:
+                    self.visualizer.update_plot()
+            except Exception as e:
+                self.logger.error(f"Error updating RAG system: {str(e)}", exc_info=True)
+        else:
+            self.logger.debug("Skipping duplicate message")
 
-                    console.print("\n")  # Extra line before code block
-                    syntax = Syntax('\n'.join(code_block), code_lang or "python", theme="monokai", line_numbers=False)
-                    if sender != self.user_name:
-                        console.print(Align.right(syntax))
-                    else:
-                        console.print(syntax)
-                    console.print("\n")  # Extra line after code block
+    async def generate_moderator_summary_for_history(self, thread_id: str) -> str:
+        self.logger.debug(f"Generating moderator summary for historical thread: {thread_id}")
+        self.thinking_participant = "Moderator"
 
-                    in_code_block = False
-                    code_block = []
-                else:
-                    # Start of code block
-                    print_current_panel()
-                    current_panel_content = Text()
-                    in_code_block = True
-                    code_lang = line[3:].strip()
-            elif in_code_block:
-                code_block.append(line)
-            else:
-                # Format regular text, highlighting participant names
-                formatted_line = Text()
-                words = line.split()
-                for word in words:
-                    participant_match = False
-                    for participant, details in AI_PERSONALITIES.items():
-                        if participant.lower() in word.lower():
-                            color = details.get('color', 'white')
-                            # Use inverse colors for participant names
-                            formatted_line.append(word, style=Style(color="black", bgcolor=color, bold=True))
-                            participant_match = True
-                            break
-                    if not participant_match:
-                        formatted_line.append(word)
-                    formatted_line.append(" ")
-                current_panel_content.append(formatted_line)
-                current_panel_content.append('\n')
+        try:
+            await self.create_session()
 
-        # Print any remaining content
-        print_current_panel()
-        console.print("")  # single line between responses
+            # Get the conversation context for the historical thread
+            conversation_text = self.get_conversation_context_for_history(thread_id)
 
-        self.logging.debug("Message formatted and printed successfully")
+            if not conversation_text or conversation_text == "No conversation history found for the given thread ID.":
+                return "Unable to generate summary: No conversation history found."
 
-    def get_conversation_context(self) -> str:
+            # Use the ContextDetector to determine the conversation context
+            context_detector = HELPER_PERSONALITIES['ContextDetector']
+            context_ai_config = AI_CONFIG[context_detector['ai_name']]
+            context_prompt = f"{context_detector['system_message']}\n\nConversation:\n{conversation_text}\n\nContext category:"
+
+            context_category = ""
+            async for partial_context in context_ai_config['generate_func'](context_ai_config['model'], context_prompt):
+                context_category += partial_context.strip()
+
+            self.logger.debug(f"ContextDetector determined category: {context_category}")
+
+            # Generate the moderator summary based on the context
+            moderator = HELPER_PERSONALITIES['Moderator']
+            moderator_ai_config = AI_CONFIG[moderator['ai_name']]
+            moderator_prompt = f"{moderator['system_message']}\n\nConversation context: {context_category}\n\nConversation:\n{conversation_text}\n\nProvide a summary based on the conversation context:"
+
+            summary = ""
+            async for partial_summary in moderator_ai_config['generate_func'](moderator_ai_config['model'],
+                                                                              moderator_prompt):
+                summary += partial_summary
+
+            self.logger.debug("Moderator summary for historical thread generated successfully")
+            return summary
+
+        except Exception as e:
+            self.logger.error(f"Error generating moderator summary for historical thread: {str(e)}", exc_info=True)
+            return f"Unable to generate summary: {str(e)}"
+        finally:
+            self.thinking_participant = None
+            await self.close_session()
+
+    def get_conversation_context_for_history(self, thread_id: str) -> str:
+        if thread_id in self.conversation_history:
+            thread = self.conversation_history[thread_id]
+            messages = thread.messages  # Access the messages attribute
+            return "\n".join([f"{msg.sender}: {msg.message}" for msg in messages])
+        else:
+            return "No conversation history found for the given thread ID."
+
+    def update_token_usage(self, tokens: int):
         """
-        Retrieves the current conversation context as a formatted string.
+        Update the token usage count and emit the updated total.
 
-        This method compiles the conversation history for the current thread into a single string,
-        which can be used as context for generating AI responses.
+        Args:
+            tokens (int): The number of tokens to add to the total.
+        """
+        self.total_tokens += tokens
+        self.token_usage_updated.emit(self.total_tokens)
+        self.logger.debug(f"Updated token usage. Total tokens: {self.total_tokens}")
+
+    def get_current_context(self) -> str:
+        """
+        Get the current context of the conversation.
 
         Returns:
-            str: A string representation of the current conversation context.
+            str: The current context as a string.
         """
-        self.logging.debug("Getting conversation context")
+        try:
+            recent_messages = self.conversation_history[self.current_thread_id][-5:]
+            return "\n".join([f"{msg['sender']}: {msg['message']}" for msg in recent_messages])
+        except Exception as e:
+            self.logger.error(f"Error getting current context: {str(e)}", exc_info=True)
+            return ""
+
+    def get_conversation_context(self, thread_id: str) -> str:
+        try:
+            if self.current_round == 1:
+                return f"This is the start of a new conversation topic (Thread ID: {thread_id})."
+
+            recent_context = self.rag.get_recent_messages(5)
+            if not recent_context:
+                return f"No recent context available for this topic (Thread ID: {thread_id})."
+
+            relevant_history = self.rag.get_relevant_history(recent_context)
+
+            if relevant_history:
+                full_context = f"Recent relevant conversation (Thread ID: {thread_id}):\n{relevant_history}\n\nCurrent context:\n{recent_context}"
+            else:
+                full_context = f"Current context (Thread ID: {thread_id}):\n{recent_context}"
+
+            self.context_token_count = self.count_tokens(full_context)
+            return full_context
+        except Exception as e:
+            self.logger.error(f"Error retrieving conversation context from RAG for thread {thread_id}: {str(e)}",
+                              exc_info=True)
+            return f"Error retrieving context for thread {thread_id}. Starting with a clean slate."
+
+    def get_fallback_context(self) -> str:
+        """
+        Get a fallback context when RAG fails.
+
+        Returns:
+            str: The fallback context as a string.
+        """
+        self.logger.warning("Using fallback method for context retrieval")
         if self.current_thread_id not in self.conversation_history:
             return ""
 
@@ -281,253 +287,527 @@ class ConversationManager:
                 context.append(f"{sender}: {content}")
         return "\n".join(context)
 
-    async def generate_ai_response(self, prompt: str, participant: str) -> AsyncGenerator[str, None]:
+    def get_tokenizer(self, model: str):
         """
-        Generates an AI response for a given participant.
-
-        This method creates a full prompt by combining the system message, participant's personality,
-        conversation context, and user prompt. It then uses the appropriate AI model to generate
-        a response.
+        Get the appropriate tokenizer for a given model.
 
         Args:
-            prompt (str): The user's input prompt.
-            participant (str): The name of the AI participant generating the response.
+            model (str): The model name.
 
-        Yields:
-            str: Partial responses as they are generated.
-
-        Raises:
-            Exception: If there's an error during the response generation process.
+        Returns:
+            Tokenizer: The tokenizer for the specified model.
         """
-        self.logging.debug(f"Generating AI response for {participant}")
+        if model.startswith("gpt-3.5"):
+            return self.p50k_tokenizer
+        else:  # Claude models and GPT-4 use cl100k
+            return self.cl100k_tokenizer
+
+    def count_tokens(self, text: str, model: str = "claude-3-opus-20240229") -> int:
+        """
+        Count the number of tokens in a given text for a specific model.
+
+        Args:
+            text (str): The text to count tokens for.
+            model (str): The model to use for token counting.
+
+        Returns:
+            int: The number of tokens in the text.
+        """
+        tokenizer = self.get_tokenizer(model)
+        return len(tokenizer.encode(text))
+
+    async def generate_ai_conversation(self, prompt: str, active_participants: List[str]) -> Dict[
+        str, Tuple[str, str, str]]:
+        self.logger.debug(f"Generating AI conversation for prompt: {prompt}")
+        await self.create_session()
+
+        if not self.current_thread_id or self.current_thread_id not in self.conversation_history:
+            self.new_topic()
+
+        # Update conversation with user's prompt only once
+        self.update_conversation(prompt, self.user_name, "Human", self.user_name)
+
+        responses = {}
+        self.responded_participants.clear()
+
+        try:
+            for participant in active_participants:
+                self.logger.debug(f"Generating response for participant: {participant}")
+                response, ai_name, model = await self.generate_single_response(participant, prompt)
+                if response:  # Only add non-empty responses
+                    responses[participant] = (response, ai_name, model)
+                    # Update conversation here instead of in generate_single_response
+                    self.update_conversation(response, participant, ai_name, model)
+                    self.ai_response_generated.emit(participant, response, ai_name, model)
+                    self.logger.debug(f"Response generated for {participant}: {response[:50]}...")
+
+            self.logger.info(f"Round of responses completed. Total responses: {len(responses)}")
+
+            if set(active_participants) == self.responded_participants:
+                self.logger.info("All active participants have responded. Generating topic.")
+                topic = await self.generate_topic(prompt, responses)
+                self.update_conversation_topic(topic)
+                self.logger.info(f"Topic generated: {topic}")
+            else:
+                self.logger.info("Not all active participants have responded. Skipping topic generation.")
+                missing_participants = set(active_participants) - self.responded_participants
+                self.logger.debug(f"Participants who didn't respond: {missing_participants}")
+
+            return responses
+        except Exception as e:
+            self.logger.error(f"Error in generate_ai_conversation: {str(e)}", exc_info=True)
+            return {"System": (f"An error occurred in the conversation: {str(e)}", "System", "System")}
+
+    async def generate_topic(self, prompt: str, responses: Dict[str, Tuple[str, str, str]] = None) -> str:
+        self.logger.debug("Generating topic for the conversation")
+        topic_generator = HELPER_PERSONALITIES['TopicGenerator']
+        ai_config = AI_CONFIG[topic_generator['ai_name']]
+
+        # Create a context that includes the full conversation history
+        context = self.get_conversation_context(self.current_thread_id)
+
+        topic_prompt = f"{topic_generator['system_message']}\n\nConversation context:\n{context}\n\nGenerate a topic based on this conversation:"
+
+        topic = ""
+        async for partial_topic in ai_config['generate_func'](ai_config['model'], topic_prompt):
+            topic += partial_topic.strip()
+
+        self.logger.debug(f"Generated topic: {topic}")
+
+        # Set the generated topic in the conversation history
+        self.update_conversation_topic(topic)
+
+        return topic
+
+    def extract_ai_response(self, full_response: str, participant: str) -> str:
+        self.logger.debug(f"Extracting AI response for {participant}")
+        try:
+            # If the response is already in the correct format, return it
+            if isinstance(full_response, str) and not full_response.startswith(participant):
+                return full_response.strip()
+
+            # Try to extract the response using regex
+            pattern = f"{re.escape(participant)}:(?!.*{re.escape(participant)}:)"
+            match = re.search(pattern, full_response, re.DOTALL)
+
+            if match:
+                extracted_response = full_response[match.end():].strip()
+                self.logger.debug("Successfully extracted AI response using regex")
+                return extracted_response
+
+            # If regex fails, try splitting the string
+            parts = full_response.split(f"{participant}:", 1)
+            if len(parts) > 1:
+                extracted_response = parts[1].strip()
+                self.logger.debug("Extracted AI response using string split")
+                return extracted_response
+
+            # If all extraction methods fail, return the full response
+            self.logger.warning("Failed to extract AI response, returning full response")
+            return full_response.strip()
+        except Exception as e:
+            self.logger.error(f"Error in extract_ai_response: {str(e)}", exc_info=True)
+            return f"Error extracting response: {str(e)}"
+
+    async def generate_single_response(self, participant: str, prompt: str) -> Tuple[str, str, str]:
+        self.thinking_participant = participant
+        self.logger.debug(f"Generating single response for {participant}")
+
+        if self.is_interrupted:
+            return "", "", ""
+
+        if self.is_gui:
+            self.ai_thinking_started.emit(participant)
+
+        ai_response = ""
+        ai_name = ""
+        model = ""
+        try:
+            self.used_rag = False
+            self.context_token_count = 0
+            self.response_token_count = 0
+
+            full_response = ""
+            async for partial_response in self.generate_ai_response(prompt, participant):
+                if self.is_interrupted:
+                    break
+                full_response += partial_response
+
+            ai_response = self.extract_ai_response(full_response, participant)
+            self.logger.debug(f"Extracted response for {participant}: %.100s...", ai_response)
+
+            # Get AI name and model
+            ai_personality = AI_PERSONALITIES.get(participant) or HELPER_PERSONALITIES.get(participant)
+            ai_name = ai_personality['ai_name']
+            ai_config = AI_CONFIG.get(ai_name)
+            model = ai_config['model'] if ai_config else "Unknown"
+
+            # Remove the update_conversation call from here
+
+            # Update token usage
+            self.update_token_usage(self.count_tokens(ai_response))
+
+            # Add participant to the responded set
+            self.responded_participants.add(participant)
+            self.logger.debug(f"Added {participant} to responded participants")
+
+        except Exception as e:
+            self.logger.error(f"Error generating response for {participant}: {str(e)}", exc_info=True)
+            ai_response = f"Error: {str(e)}"
+            ai_name = "Error"
+            model = "Error"
+
+        finally:
+            self.thinking_participant = None
+            if self.is_gui:
+                self.ai_thinking_finished.emit(participant)
+
+        return ai_response, ai_name, model
+
+    async def detect_addressed_participant(self, message: str) -> Optional[str]:
+        """
+        Detect which participant (if any) a message is addressed to.
+
+        Args:
+            message (str): The message to analyze.
+
+        Returns:
+            Optional[str]: The name of the addressed participant, or None if not detected.
+        """
+        self.logger.debug("Detecting addressed participant for message")
+
+        participants = list(AI_PERSONALITIES.keys()) + [self.user_name]
+        response_detector = HELPER_PERSONALITIES['ResponseDetector']
+        ai_config = AI_CONFIG[response_detector['ai_name']]
+
+        prompt = f"{response_detector['system_message']}\n\nMessage: {message}\n\nParticipants: {', '.join(participants)}\n\nAddressed participant:"
+
+        try:
+            async for partial_response in ai_config['generate_func'](ai_config['model'], prompt):
+                if partial_response.strip():
+                    detected_participant = partial_response.strip()
+                    self.logger.debug(f"Detected addressed participant: {detected_participant}")
+                    return detected_participant
+        except Exception as e:
+            self.logger.error(f"Error detecting addressed participant: {str(e)}", exc_info=True)
+
+        self.logger.debug("No specific participant detected")
+        return None
+
+    async def generate_ai_response(self, prompt: str, participant: str) -> AsyncGenerator[str, None]:
+        self.logger.debug(f"Generating AI response for {participant} in thread {self.current_thread_id}")
+        await self.create_session()
+
         ai_personality = AI_PERSONALITIES.get(participant) or HELPER_PERSONALITIES.get(participant)
-        ai_config = AI_CONFIG[ai_personality['ai_name']]
+
+        if ai_personality is None:
+            self.logger.error(f"No AI personality found for participant: {participant}")
+            yield f"Error: No AI personality found for {participant}"
+            return
+
+        ai_config = AI_CONFIG.get(ai_personality['ai_name'])
+        if ai_config is None:
+            self.logger.error(f"No AI configuration found for AI name: {ai_personality['ai_name']}")
+            yield f"Error: No AI configuration found for {participant}"
+            return
+
+        model = ai_config['model']
 
         system_message = MASTER_SYSTEM_MESSAGE['system_message'].format(
             user_name=self.user_name,
             participants=", ".join([p for p in AI_PERSONALITIES if p != participant])
         )
 
-        conversation_context = self.get_conversation_context()
-        full_prompt = f"{system_message}\n{ai_personality['system_message']}\n\nConversation history:\n{conversation_context}\n\nUser: {prompt}\n{participant}:"
+        conversation_context = self.get_conversation_context(self.current_thread_id)
+
+        is_new_topic = self.current_round == 1
+        new_topic_indicator = f"This is a new conversation topic (Thread ID: {self.current_thread_id}). Please do not reference any previous conversations. " if is_new_topic else ""
+
+        full_prompt = f"{system_message}\n{ai_personality['system_message']}\n\n{new_topic_indicator}{conversation_context}\n\nUser: {prompt}\n{participant}:"
+
+        self.context_token_count = self.count_tokens(full_prompt, model)
+        self.response_token_count = 0
 
         try:
-            self.logging.debug(f"Sending full prompt to AI model for {participant}")
-            async for partial_response in ai_config['generate_func'](ai_config['model'], full_prompt):
+            self.logger.debug(f"Sending full prompt to AI model for {participant} in thread {self.current_thread_id}")
+            async for partial_response in ai_config['generate_func'](model, full_prompt):
+                if self.is_interrupted:
+                    self.logger.info(f"AI response generation for {participant} interrupted")
+                    return
+                self.response_token_count += self.count_tokens(partial_response, model)
+                self.total_tokens += self.count_tokens(partial_response, model)
+                if self.is_gui:
+                    self.token_usage_updated.emit(self.total_tokens)
                 yield partial_response
+
         except Exception as e:
-            error_message = f"Error generating AI response for {participant}: {str(e)}"
-            self.logging.error(error_message)
+            error_message = f"Error generating AI response for {participant} in thread {self.current_thread_id}: {str(e)}"
+            self.logger.error(error_message, exc_info=True)
             log_ai_error(ai_personality['ai_name'], error_message)
-            yield f"{participant} is not available at the moment."
+            yield f"{participant} is not available at the moment. Error: {str(e)}"
 
-    def extract_ai_response(self, full_response: str, participant: str) -> str:
-        """
-        Extracts the AI's response from the full response string.
-
-        This method isolates the AI's actual response from the full text returned by the AI model,
-        which may include repetitions of the prompt or other extraneous information.
-
-        Args:
-            full_response (str): The full response including system message and context.
-            participant (str): The name of the AI participant.
-
-        Returns:
-            str: The extracted AI response.
-        """
-        self.logging.debug(f"Extracting AI response for {participant}")
-        pattern = f"{re.escape(participant)}:(?!.*{re.escape(participant)}:)"
-        match = re.search(pattern, full_response, re.DOTALL)
-
-        if match:
-            return full_response[match.end():].strip()
-        else:
-            parts = full_response.split(f"{participant}:", 1)
-            if len(parts) > 1:
-                return parts[1].strip()
-            else:
-                return full_response.strip()
-
-    async def generate_single_response(self, participant: str, prompt: str, responding_to: str = None):
-        """
-        Generates and processes a single AI response.
-
-        This method handles the process of generating a response from a single AI participant,
-        including displaying a "thinking" message, extracting the response, and updating the
-        conversation history.
-
-        Args:
-            participant (str): The name of the AI participant generating the response.
-            prompt (str): The input prompt or context for the response.
-            responding_to (str, optional): The name of the participant being responded to, if any.
-        """
-        self.thinking_participant = participant
-        self.logging.debug(f"Generating single response for {participant}")
-        thinking_task = asyncio.create_task(self.display_thinking_message(participant))
-
-        try:
-            full_response = ""
-            async for partial_response in self.generate_ai_response(prompt, participant):
-                full_response += partial_response
-
-            ai_response = self.extract_ai_response(full_response, participant)
-            self.logging.debug(f"Extracted response for {participant}: {ai_response[:100]}...")
-        except Exception as e:
-            self.logging.error(f"Error generating response for {participant}: {str(e)}")
-            ai_response = f"Error generating response for {participant}: {str(e)}"
         finally:
-            self.thinking_participant = None
-            thinking_task.cancel()  # Cancel the thinking task
-            await asyncio.sleep(0.1)  # Give a moment for the thinking message to clear
+            if is_new_topic:
+                self.current_round += 1
 
-            # Clear the entire line where the spinner was
-            print("\033[K", end="", flush=True)
-            # Move the cursor to the beginning of the line
-            print("\r", end="", flush=True)
+    async def evaluate_response(self, response: str, participant: str) -> Tuple[str, Optional[str]]:
+        detector = HELPER_PERSONALITIES['ResponseDetector']
+        ai_config = AI_CONFIG[detector['ai_name']]
 
-            self.update_conversation(ai_response, participant)
-            self.logging.debug(f"Added response from {participant} to conversation history")
+        prompt = f"{detector['system_message']}\n\nResponse: {response}\n\nEvaluate if this response is directed at the user or another AI participant."
 
-    async def display_thinking_message(self, participant: str):
-        """
-        Displays a "thinking" message for the AI participant.
+        evaluation = ""
+        async for partial_eval in ai_config['generate_func'](ai_config['model'], prompt):
+            evaluation += partial_eval
 
-        This method shows a spinner with a message indicating that the AI is thinking or responding.
-        It continues until the thinking_participant attribute is changed.
+        if "user" in evaluation.lower():
+            return "user", None
+        elif any(participant in evaluation.lower() for participant in self.participants):
+            for p in self.participants:
+                if p.lower() in evaluation.lower():
+                    return "ai", p
+        return "general", None
 
-        Args:
-            participant (str): The name of the AI participant who is "thinking".
-        """
-        message = f"{participant} is thinking..."
-        if hasattr(self, 'responding_to') and self.responding_to:
-            message = f"{participant} is responding to {self.responding_to}..."
-        spinner = Spinner('dots', text=message)
-        with Live(spinner, refresh_per_second=10, transient=True) as live:
-            while self.thinking_participant == participant:
-                await asyncio.sleep(0.1)
+    async def continue_conversation(self, user_input: str, active_participants: List[str]) -> Optional[str]:
+        self.logger.debug(f"Continuing conversation with user input: {user_input}")
+        self.is_interrupted = False  # Reset interrupt flag at the start of conversation continuation
 
-    async def detect_addressed_participant(self, message: str) -> str:
-        """
-        Detects which participant a message is addressed to.
-
-        This method uses a helper AI to determine if the message is directed at a specific participant.
-
-        Args:
-            message (str): The message to analyze.
-
-        Returns:
-            str: The name of the addressed participant, or None if not detected.
-        """
-        self.logging.debug("Detecting addressed participant")
-        response_detector = HELPER_PERSONALITIES['ResponseDetector']
-        ai_config = AI_CONFIG[response_detector['ai_name']]
-
-        prompt = f"{response_detector['system_message']}\n\nMessage: {message}\n\nDetermine which participant, if any, this message is directed at. If the message is soliciting a response from the human user ({self.user_name}), respond with '{self.user_name}'."
+        if not self.current_thread_id or self.current_thread_id not in self.conversation_history:
+            self.logger.error("No valid conversation thread")
+            return "An error occurred. Please start a new conversation."
 
         try:
-            detector_response = ""
-            async for chunk in ai_config['generate_func'](ai_config['model'], prompt):
-                detector_response += chunk
+            addressed_participant = await self.detect_addressed_participant(user_input)
 
-            addressed_participant = detector_response.strip()
-            self.logging.debug(f"Detected addressed participant: {addressed_participant}")
-            return addressed_participant if addressed_participant not in ['None', 'null', ''] else None
-        except Exception as e:
-            self.logging.error(f"Error in participant detection: {str(e)}")
-            return None
+            if addressed_participant:
+                if addressed_participant == self.user_name:
+                    return f"The question was directed at you. Please respond."
+                elif addressed_participant in active_participants:
+                    if self.is_interrupted:
+                        self.logger.info("Conversation interrupted before generating response")
+                        return "Conversation interrupted"
+                    response, ai_name, model = await self.generate_single_response(addressed_participant, user_input)
+                    return f"{addressed_participant}: {response}\n\nYour turn to respond"
 
-    def randomize_participants(self):
-        """
-        Randomizes the order of AI participants.
+            # If no specific participant is addressed, generate responses from all active participants
+            responses = {}
+            for participant in active_participants:
+                if self.is_interrupted:
+                    self.logger.info("Conversation continuation interrupted")
+                    return "Conversation interrupted"
+                response, ai_name, model = await self.generate_single_response(participant, user_input)
+                if response:
+                    responses[participant] = (response, ai_name, model)
+                    # self.ai_response_generated.emit(participant, response, ai_name, model)
 
-        This method shuffles the list of participants to ensure a random order of responses
-        in the conversation.
-        """
-        self.participants = random.sample(self.participants, len(self.participants))
-        self.logging.debug(f"Randomized participant order: {', '.join(self.participants)}")
+            # Generate topic after the first round if it hasn't been generated yet
+            if self.current_round == 1:
+                topic = await self.generate_topic(user_input)
+                self.update_conversation_topic(topic)
+                self.current_round += 1
 
-    async def generate_ai_conversation(self, prompt: str):
-        """
-        Generates a full AI conversation based on a given prompt.
-
-        This method orchestrates the conversation flow by:
-        1. Randomizing the order of AI participants.
-        2. Generating responses from each participant.
-        3. Detecting if a response is directed at a specific participant.
-        4. Handling additional responses for directed messages.
-        5. Checking if the conversation requires user input.
-
-        Args:
-            prompt (str): The initial prompt or user input to start the conversation.
-        """
-        self.logging.debug(f"Generating AI conversation for prompt: {prompt}")
-
-        # Randomize the order of participants
-        randomized_participants = random.sample(self.participants, len(self.participants))
-        participant_cycle = cycle(randomized_participants)
-        current_participant = next(participant_cycle)
-        self.logging.debug(f"Randomized participant order: {', '.join(randomized_participants)}")
-
-        try:
-            for _ in range(len(self.participants)):  # Ensure each participant gets a turn
-                self.logging.debug(f"Current participant: {current_participant}")
-                await self.generate_single_response(current_participant, prompt)
-
-                last_message = self.conversation_history[self.current_thread_id][-1]['message']
-                addressed_participant = await self.detect_addressed_participant(last_message)
-                self.logging.debug(f"Detected addressed participant: {addressed_participant}")
-
-                if addressed_participant and addressed_participant in self.participants and addressed_participant != current_participant:
-                    self.logging.info(f"Message from {current_participant} was directed at {addressed_participant}")
-                    # Generate a single response from the addressed participant
-                    await self.generate_single_response(addressed_participant, prompt,
-                                                        responding_to=current_participant)
-
-                # Move to the next participant in the cycle
-                current_participant = next(participant_cycle)
-
-            # After all participants have spoken, check if the user needs to respond
-            last_message = self.conversation_history[self.current_thread_id][-1]['message']
-            final_addressed_participant = await self.detect_addressed_participant(last_message)
-            if final_addressed_participant == self.user_name:
-                self.logging.info(f"Conversation is soliciting a response from the user")
-                return  # Exit the method to allow user input in the main loop
+            if responses:
+                formatted_responses = "\n".join([f"{p}: {r[0]}" for p, r in responses.items()])
+                return f"{formatted_responses}\n\nYour turn to respond"
+            else:
+                return "No responses were generated. Please try again."
 
         except Exception as e:
-            self.logging.error(f"Error in generate_ai_conversation: {str(e)}")
-            return  # Return to main loop to get user input
+            self.logger.error(f"Error in continue_conversation: {str(e)}", exc_info=True)
+            return "An error occurred in the conversation. Please try again."
 
-        self.logging.debug("Finished generating AI conversation")
-
-    async def generate_moderator_summary(self):
-        """
-        Generates a summary of the conversation by the moderator.
-
-        This method uses a moderator AI to create a summary of the current conversation thread.
-        The summary is then added to the conversation history.
-        """
-        self.logging.debug("Generating moderator summary")
+    async def generate_moderator_summary(self) -> str:
+        self.logger.debug("Generating moderator summary")
         self.thinking_participant = "Moderator"
-        moderator = HELPER_PERSONALITIES['Moderator']
-        self.console.print(
-            f"[italic {moderator['color']}]Moderator is summarizing the conversation...[/italic {moderator['color']}]")
 
         try:
-            ai_config = AI_CONFIG[moderator['ai_name']]
+            await self.create_session()
 
-            conversation_text = self.get_conversation_context()
-            prompt = f"{moderator['system_message']}\n\nConversation:\n{conversation_text}\n\nProvide a summary of this conversation."
+            # First, use the ContextDetector to determine the conversation context
+            context_detector = HELPER_PERSONALITIES['ContextDetector']
+            context_ai_config = AI_CONFIG[context_detector['ai_name']]
+
+            conversation_text = self.get_conversation_context(self.current_thread_id)
+            context_prompt = f"{context_detector['system_message']}\n\nConversation:\n{conversation_text}\n\nContext category:"
+
+            context_category = ""
+            async for partial_context in context_ai_config['generate_func'](context_ai_config['model'], context_prompt):
+                context_category += partial_context.strip()
+
+            self.logger.debug(f"ContextDetector determined category: {context_category}")
+
+            # Now, generate the moderator summary based on the context
+            moderator = HELPER_PERSONALITIES['Moderator']
+            moderator_ai_config = AI_CONFIG[moderator['ai_name']]
+
+            moderator_prompt = f"{moderator['system_message']}\n\nConversation context: {context_category}\n\nConversation:\n{conversation_text}\n\nProvide a summary based on the conversation context:"
 
             summary = ""
-            async for partial_summary in ai_config['generate_func'](ai_config['model'], prompt):
+            async for partial_summary in moderator_ai_config['generate_func'](moderator_ai_config['model'],
+                                                                              moderator_prompt):
                 summary += partial_summary
 
-            self.logging.debug("Moderator summary generated successfully")
-            self.update_conversation(summary, "Moderator")
+            # Format the summary using the same method as regular conversations
+            formatted_summary = self.format_message(summary)
+
+            self.logger.debug("Moderator summary generated successfully")
+            self.update_conversation(formatted_summary, "Moderator")
+            return formatted_summary
 
         except Exception as e:
-            self.logging.error(f"Error generating moderator summary: {str(e)}")
-            self.update_conversation("Unable to generate summary at this time.", "System")
+            self.logger.error(f"Error generating moderator summary: {str(e)}", exc_info=True)
+            return "Unable to generate summary at this time."
         finally:
             self.thinking_participant = None
 
+    def format_message(self, message: str) -> str:
+        """
+        Format a message, wrapping code blocks with the appropriate markers.
+        """
+        lines = message.split('\n')
+        formatted_lines = []
+        in_code_block = False
+        for line in lines:
+            if line.strip().startswith('```') or line.strip().startswith('==='):
+                if in_code_block:
+                    formatted_lines.append("=== code end ===")
+                else:
+                    formatted_lines.append("=== code begin ===")
+                in_code_block = not in_code_block
+            else:
+                formatted_lines.append(line)
+
+        if in_code_block:
+            formatted_lines.append("=== code end ===")
+
+        return '\n'.join(formatted_lines)
+
+    def new_topic(self):
+        self.logger.info("Starting a new topic")
+        self.current_thread_id = f"thread_{len(self.conversation_history) + 1}"
+        self.conversation_history[self.current_thread_id] = ConversationThread(
+            date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            topic="",  # Set an empty topic
+            messages=[]
+        )
+        self.responded_participants.clear()
+        self.current_round = 0  # Reset the current_round when starting a new topic
+        self.logger.info(f"Started new conversation topic with thread ID: {self.current_thread_id}")
+
+        # Create a new RAG instance
+        try:
+            self.rag = ConversationRAG()
+            self.logger.info("Created new ConversationRAG instance for new topic")
+
+            # If a visualizer exists, update it with the new RAG instance
+            if self.visualizer:
+                self.visualizer.set_rag(self.rag)
+                self.logger.info("Updated visualizer with new RAG instance")
+
+        except Exception as e:
+            self.logger.error(f"Error creating new RAG instance: {str(e)}", exc_info=True)
+            self.logger.warning("Continuing with existing RAG instance")
+
+        # Reset token counts for the new topic
+        self.context_token_count = 0
+        self.response_token_count = 0
+        self.total_tokens = 0
+
+        # Emit signal to update token usage display in GUI
+        if self.is_gui:
+            self.token_usage_updated.emit(self.total_tokens)
+
+        # Clear the topic
+        self.update_conversation_topic("")
+
+    def start_conversation(self):
+        self.logger.info("Initializing new conversation")
+        initial_message = "A new conversation topic has been started. What would you like to discuss?"
+        self.update_conversation(initial_message, "System")
+        if self.is_gui:
+            self.ai_response_generated.emit("System", initial_message)
+
+    def trigger_graph_update(self):
+        if self.visualizer:
+            self.visualizer.update_plot()
+
+    def format_and_print_message(self, message: str, sender: str) -> None:
+        """
+        Format and print a message to the console.
+
+        Args:
+            message (str): The message to print.
+            sender (str): The sender of the message.
+        """
+        if sender in AI_PERSONALITIES:
+            color = AI_PERSONALITIES[sender]['color']
+        elif sender in HELPER_PERSONALITIES:
+            color = HELPER_PERSONALITIES[sender]['color']
+        else:
+            color = 'white'
+
+        formatted_message = f"[bold {color}]{sender}:[/bold {color}] {message}"
+        self.console.print(formatted_message)
+
+    def get_conversation_summary(self) -> str:
+        """
+        Get a summary of the current conversation.
+
+        Returns:
+            str: A summary of the conversation.
+        """
+        if not self.current_thread_id or self.current_thread_id not in self.conversation_history:
+            return "No active conversation."
+
+        messages = self.conversation_history[self.current_thread_id]
+        summary = f"Conversation summary (Thread ID: {self.current_thread_id}):\n"
+        for msg in messages:
+            summary += f"{msg['sender']}: {msg['message'][:50]}...\n"
+        return summary
+
+    def get_token_usage(self) -> Dict[str, int]:
+        """
+        Get the current token usage statistics.
+
+        Returns:
+            Dict[str, int]: A dictionary containing token usage statistics.
+        """
+        return {
+            "context_tokens": self.context_token_count,
+            "response_tokens": self.response_token_count,
+            "total_tokens": self.total_tokens
+        }
+
+    def set_visualizer(self, visualizer: VectorGraphVisualizer) -> None:
+        """
+        Set the visualizer for the conversation manager.
+
+        Args:
+            visualizer (VectorGraphVisualizer): The visualizer to use.
+        """
+        self.visualizer = visualizer
+        self.logger.debug("Visualizer set for ConversationManager")
+
+    def set_console(self, console) -> None:
+        """
+        Set the console for the conversation manager.
+
+        Args:
+            console: The console to use for output.
+        """
+        self.console = console
+        self.logger.debug("Console set for ConversationManager")
+
+    def __del__(self):
+        """
+        Clean up resources when the ConversationManager is destroyed.
+        """
+        try:
+            self.save_conversation_history()
+            self.logger.debug("ConversationManager destroyed, conversation history saved")
+        except Exception as e:
+            self.logger.error(f"Error in ConversationManager destructor: {str(e)}")
+
+        # Use asyncio.run to close the session in the destructor
+        if hasattr(self, 'session') and self.session and not self.session.closed:
+            asyncio.run(self.close_session())
