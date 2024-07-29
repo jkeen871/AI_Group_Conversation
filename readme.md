@@ -131,7 +131,7 @@ The application offers a rich set of GUI features:
 ## 7. Setup and Installation
 1. Clone the repository:
    ```
-   git clone https://github.com/yourusername/ai-conversation-gui.git
+   git clone https://github.com/jkeen871/ai-conversation-gui.git
    cd ai-conversation-gui
    ```
 
