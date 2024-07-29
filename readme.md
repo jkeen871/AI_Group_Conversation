@@ -24,10 +24,9 @@
 The AI Conversation GUI Application is an advanced, interactive graphical user interface that facilitates conversations with multiple AI personalities using state-of-the-art language models. It manages complex conversation flows, provides a rich visual interface for user interactions, and offers various features for customization and analysis of AI-driven conversations.
 
 ## 2. Screenshots
-![AI Conversation Interface](https://github.com/jkeen871/AI_Group_Conversation/blob/master/screenshots/Screenshot%20from%202024-07-28%2015-58-16.png)
+![AI Conversation Interface](https://github.com/jkeen871/AI_Group_Conversation/blob/master/screenshots/Screenshot%20from%202024-07-29%2012-22-22.png)
 ![AI Conversation Interface](https://github.com/jkeen871/AI_Group_Conversation/blob/master/screenshots/Screenshot%20from%202024-07-28%2015-59-26.png)
 ![AI Conversation Interface](https://github.com/jkeen871/AI_Group_Conversation/blob/master/screenshots/Screenshot%20from%202024-07-28%2015-59-48.png)
-![AI Conversation Interface](https://github.com/jkeen871/AI_Group_Conversation/blob/master/screenshots/Screenshot%20from%202024-07-28%2016-02-04.png)
 
 ## 3. Features
 - Multi-AI personality conversations
