@@ -24,12 +24,13 @@ from google_api import get_gmail_service
 
 
 class ModeratorReplyThread(QThread):
-    reply_received = pyqtSignal(str)
+    reply_received = pyqtSignal(str, str)  # Changed to emit both summary and thread topic
 
-    def __init__(self, conversation_manager, thread_id):
+    def __init__(self, conversation_manager, thread_id, thread_topic):
         super().__init__()
         self.conversation_manager = conversation_manager
         self.thread_id = thread_id
+        self.thread_topic = thread_topic
 
     def run(self):
         loop = asyncio.new_event_loop()
@@ -38,15 +39,16 @@ class ModeratorReplyThread(QThread):
             reply = loop.run_until_complete(
                 self.conversation_manager.generate_moderator_summary_for_history(self.thread_id)
             )
-            self.reply_received.emit(reply)
+            self.reply_received.emit(reply, self.thread_topic)
         finally:
             loop.close()
 
 
 class ModeratorSummaryDialog(QDialog):
-    def __init__(self, parent=None, summary=""):
+    def __init__(self, parent=None, summary="", thread_topic=""):
         super().__init__(parent)
         self.summary = summary
+        self.thread_topic = thread_topic
         self.init_ui()
 
     def init_ui(self):
@@ -68,14 +70,16 @@ class ModeratorSummaryDialog(QDialog):
         layout.addWidget(close_button)
 
     def open_email_dialog(self):
-        email_dialog = EmailDialog(self, self.summary)
+        subject = f"Summary of: {self.thread_topic}"
+        email_dialog = EmailDialog(self, self.summary, subject)
         email_dialog.exec_()
 
 
 class EmailDialog(QDialog):
-    def __init__(self, parent=None, summary=""):
+    def __init__(self, parent=None, content="", subject=""):
         super().__init__(parent)
-        self.summary = summary
+        self.content = content
+        self.subject = subject
         self.init_ui()
 
     def init_ui(self):
@@ -87,10 +91,10 @@ class EmailDialog(QDialog):
         layout.addWidget(QLabel("To:"))
         layout.addWidget(self.to_email)
 
-        self.subject = QLineEdit()
-        self.subject.setText("Conversation Summary")
+        self.subject_line = QLineEdit()
+        self.subject_line.setText(self.subject)
         layout.addWidget(QLabel("Subject:"))
-        layout.addWidget(self.subject)
+        layout.addWidget(self.subject_line)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         button_box.accepted.connect(self.send_email)
@@ -104,8 +108,8 @@ class EmailDialog(QDialog):
 
     def send_email(self):
         to_email = self.to_email.text()
-        subject = self.subject.text()
-        body = self.summary
+        subject = self.subject_line.text()
+        body = self.content
 
         try:
             service = get_gmail_service()
@@ -174,11 +178,21 @@ class EmailSetupWindow(QDialog):
         self.accept()
 
 
-class ConversationHistoryWindow(QDialog):  # Changed from QMainWindow to QDialog
+import json
+import logging
+from PyQt5.QtWidgets import (
+    QDialog, QVBoxLayout, QComboBox, QTextEdit, QPushButton,
+    QHBoxLayout, QMessageBox, QStatusBar
+)
+from PyQt5.QtGui import QTextCursor, QColor, QTextCharFormat
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+
+class ConversationHistoryWindow(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.parent = parent
-        self.setModal(True)  # Make the window modal
+        self.setModal(True)
+        self.logger = logging.getLogger(self.__class__.__name__)
         self.init_ui()
         self.load_conversation_history()
         self.moderator_reply_thread = None
@@ -224,25 +238,37 @@ class ConversationHistoryWindow(QDialog):  # Changed from QMainWindow to QDialog
             # Clear existing items
             self.thread_combo.clear()
 
+            # Sort threads by date, most recent first
+            sorted_threads = sorted(self.history.items(), key=lambda x: x[1]['date'], reverse=True)
+
             # Populate combo box with formatted strings
-            for thread_id, thread_data in self.history.items():
+            for thread_id, thread_data in sorted_threads:
                 date_time = thread_data['date']
                 topic = thread_data['topic']
                 display_text = f"{date_time} - {topic}"
-                self.thread_combo.addItem(display_text, thread_id)  # Store thread_id as item data
+                self.thread_combo.addItem(display_text, thread_id)
+
+            # Set the current index to the most recent thread (index 0)
+            if self.thread_combo.count() > 0:
+                self.thread_combo.setCurrentIndex(0)
+                self.load_conversation(0)  # Load the most recent conversation
+
+            self.logger.debug(f"Loaded {len(sorted_threads)} conversation threads")
         except FileNotFoundError:
-            print("Conversation history file not found.")
+            self.logger.warning("Conversation history file not found.")
         except json.JSONDecodeError:
-            print("Error decoding the conversation history file.")
+            self.logger.error("Error decoding the conversation history file.")
 
     def load_conversation(self, index):
-        thread_id = self.thread_combo.itemData(index)  # Get the stored thread_id
+        thread_id = self.thread_combo.itemData(index)
         if thread_id in self.history:
             self.display_conversation(self.history[thread_id])
+        else:
+            self.logger.warning(f"Thread ID {thread_id} not found in history")
 
     def display_conversation(self, conversation):
         self.conversation_display.clear()
-        for message in conversation['messages']:  # Fixed: Access 'messages' key
+        for message in conversation['messages']:
             sender = message['sender']
             content = message['message']
             self.append_message_to_widget(sender, content)
@@ -268,7 +294,9 @@ class ConversationHistoryWindow(QDialog):  # Changed from QMainWindow to QDialog
             if hasattr(self.parent, 'conversation_manager'):
                 self.moderator_reply_button.setEnabled(False)
                 self.status_bar.showMessage("Generating Moderator Summary...")
-                self.moderator_reply_thread = ModeratorReplyThread(self.parent.conversation_manager, thread_id)
+                thread_topic = self.history[thread_id]['topic']  # Get the thread topic
+                self.moderator_reply_thread = ModeratorReplyThread(self.parent.conversation_manager, thread_id,
+                                                                   thread_topic)
                 self.moderator_reply_thread.reply_received.connect(self.on_moderator_reply_received)
                 self.moderator_reply_thread.finished.connect(self.on_moderator_reply_finished)
                 self.moderator_reply_thread.start()
@@ -277,9 +305,9 @@ class ConversationHistoryWindow(QDialog):  # Changed from QMainWindow to QDialog
         else:
             QMessageBox.warning(self, "No Thread Selected", "Please select a conversation thread first.")
 
-    def on_moderator_reply_received(self, reply):
+    def on_moderator_reply_received(self, reply, thread_topic):
         self.status_bar.clearMessage()
-        summary_dialog = ModeratorSummaryDialog(self, reply)
+        summary_dialog = ModeratorSummaryDialog(self, reply, thread_topic)
         summary_dialog.exec_()
 
     def on_moderator_reply_finished(self):
@@ -292,7 +320,8 @@ class ConversationHistoryWindow(QDialog):  # Changed from QMainWindow to QDialog
             if thread_id in self.history:
                 conversation = self.history[thread_id]
                 email_content = "\n\n".join([f"{msg['sender']}: {msg['message']}" for msg in conversation['messages']])
-                email_dialog = EmailDialog(self, email_content)
+                subject = f"Conversation: {conversation['topic']}"
+                email_dialog = EmailDialog(self, email_content, subject)
                 email_dialog.exec_()
             else:
                 QMessageBox.warning(self, "Error", "Selected conversation thread not found in history.")

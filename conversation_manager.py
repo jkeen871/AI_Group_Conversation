@@ -44,11 +44,12 @@ class ConversationManager(QObject):
         self.cl100k_tokenizer = tiktoken.get_encoding("cl100k_base")
         self.p50k_tokenizer = tiktoken.get_encoding("p50k_base")
         self.active_participants: List[str] = []
-        self.responded_participants: Set[str] = set()  # New: Track responded participants
+        self.responded_participants: Set[str] = set()
+        self.is_first_prompt: bool = True
         self.load_conversation_history()
-        self.new_topic()
         self.session: Optional[aiohttp.ClientSession] = None
-        self.current_round: int = 0  # Add this line
+        self.current_round: int = 0
+
 
         self.logger.debug("ConversationManager initialization complete")
 
@@ -172,43 +173,42 @@ class ConversationManager(QObject):
 
         try:
             await self.create_session()
-
-            # Get the conversation context for the historical thread
             conversation_text = self.get_conversation_context_for_history(thread_id)
-
-            if not conversation_text or conversation_text == "No conversation history found for the given thread ID.":
+            if not conversation_text:
                 return "Unable to generate summary: No conversation history found."
 
-            # Use the ContextDetector to determine the conversation context
             context_detector = HELPER_PERSONALITIES['ContextDetector']
             context_ai_config = AI_CONFIG[context_detector['ai_name']]
             context_prompt = f"{context_detector['system_message']}\n\nConversation:\n{conversation_text}\n\nContext category:"
 
-            context_category = ""
-            async for partial_context in context_ai_config['generate_func'](context_ai_config['model'], context_prompt):
-                context_category += partial_context.strip()
+            context_category = await self.generate_context_category(context_ai_config, context_prompt)
 
-            self.logger.debug(f"ContextDetector determined category: {context_category}")
-
-            # Generate the moderator summary based on the context
             moderator = HELPER_PERSONALITIES['Moderator']
             moderator_ai_config = AI_CONFIG[moderator['ai_name']]
             moderator_prompt = f"{moderator['system_message']}\n\nConversation context: {context_category}\n\nConversation:\n{conversation_text}\n\nProvide a summary based on the conversation context:"
 
-            summary = ""
-            async for partial_summary in moderator_ai_config['generate_func'](moderator_ai_config['model'],
-                                                                              moderator_prompt):
-                summary += partial_summary
+            summary = await self.generate_summary(moderator_ai_config, moderator_prompt)
 
             self.logger.debug("Moderator summary for historical thread generated successfully")
             return summary
-
         except Exception as e:
             self.logger.error(f"Error generating moderator summary for historical thread: {str(e)}", exc_info=True)
             return f"Unable to generate summary: {str(e)}"
         finally:
             self.thinking_participant = None
             await self.close_session()
+
+    async def generate_context_category(self, ai_config, prompt):
+        context_category = ""
+        async for partial_context in ai_config['generate_func'](ai_config['model'], prompt):
+            context_category += partial_context.strip()
+        return context_category
+
+    async def generate_summary(self, ai_config, prompt):
+        summary = ""
+        async for partial_summary in ai_config['generate_func'](ai_config['model'], prompt):
+            summary += partial_summary
+        return summary
 
     def get_conversation_context_for_history(self, thread_id: str) -> str:
         if thread_id in self.conversation_history:
@@ -320,6 +320,10 @@ class ConversationManager(QObject):
         str, Tuple[str, str, str]]:
         self.logger.debug(f"Generating AI conversation for prompt: {prompt}")
         await self.create_session()
+
+        if self.is_first_prompt:
+            self.new_topic()
+            self.is_first_prompt = False
 
         if not self.current_thread_id or self.current_thread_id not in self.conversation_history:
             self.new_topic()
@@ -623,42 +627,27 @@ class ConversationManager(QObject):
         try:
             await self.create_session()
 
-            # First, use the ContextDetector to determine the conversation context
+            conversation_text = self.get_conversation_context(self.current_thread_id)
             context_detector = HELPER_PERSONALITIES['ContextDetector']
             context_ai_config = AI_CONFIG[context_detector['ai_name']]
-
-            conversation_text = self.get_conversation_context(self.current_thread_id)
             context_prompt = f"{context_detector['system_message']}\n\nConversation:\n{conversation_text}\n\nContext category:"
 
-            context_category = ""
-            async for partial_context in context_ai_config['generate_func'](context_ai_config['model'], context_prompt):
-                context_category += partial_context.strip()
+            context_category = await self.generate_context_category(context_ai_config, context_prompt)
 
-            self.logger.debug(f"ContextDetector determined category: {context_category}")
-
-            # Now, generate the moderator summary based on the context
             moderator = HELPER_PERSONALITIES['Moderator']
             moderator_ai_config = AI_CONFIG[moderator['ai_name']]
-
             moderator_prompt = f"{moderator['system_message']}\n\nConversation context: {context_category}\n\nConversation:\n{conversation_text}\n\nProvide a summary based on the conversation context:"
 
-            summary = ""
-            async for partial_summary in moderator_ai_config['generate_func'](moderator_ai_config['model'],
-                                                                              moderator_prompt):
-                summary += partial_summary
-
-            # Format the summary using the same method as regular conversations
-            formatted_summary = self.format_message(summary)
+            summary = await self.generate_summary(moderator_ai_config, moderator_prompt)
 
             self.logger.debug("Moderator summary generated successfully")
-            self.update_conversation(formatted_summary, "Moderator")
-            return formatted_summary
-
+            return summary
         except Exception as e:
             self.logger.error(f"Error generating moderator summary: {str(e)}", exc_info=True)
-            return "Unable to generate summary at this time."
+            return f"Unable to generate summary: {str(e)}"
         finally:
             self.thinking_participant = None
+            await self.close_session()
 
     def format_message(self, message: str) -> str:
         """
@@ -683,42 +672,43 @@ class ConversationManager(QObject):
         return '\n'.join(formatted_lines)
 
     def new_topic(self):
-        self.logger.info("Starting a new topic")
-        self.current_thread_id = f"thread_{len(self.conversation_history) + 1}"
-        self.conversation_history[self.current_thread_id] = ConversationThread(
-            date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            topic="",  # Set an empty topic
-            messages=[]
-        )
-        self.responded_participants.clear()
-        self.current_round = 0  # Reset the current_round when starting a new topic
-        self.logger.info(f"Started new conversation topic with thread ID: {self.current_thread_id}")
+        if self.is_first_prompt:
+            self.logger.info("Creating the first topic")
+            self.current_thread_id = f"thread_{len(self.conversation_history) + 1}"
+            self.conversation_history[self.current_thread_id] = ConversationThread(
+                date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                topic="",
+                messages=[]
+            )
+            self.responded_participants.clear()
+            self.current_round = 0
+            self.is_first_prompt = False
+            self.logger.info(f"Created first conversation topic with thread ID: {self.current_thread_id}")
 
-        # Create a new RAG instance
-        try:
-            self.rag = ConversationRAG()
-            self.logger.info("Created new ConversationRAG instance for new topic")
+            # Create a new RAG instance
+            try:
+                self.rag = ConversationRAG()
+                self.logger.info("Created new ConversationRAG instance for new topic")
+                if self.visualizer:
+                    self.visualizer.set_rag(self.rag)
+                    self.logger.info("Updated visualizer with new RAG instance")
+            except Exception as e:
+                self.logger.error(f"Error creating new RAG instance: {str(e)}", exc_info=True)
+                self.logger.warning("Continuing with existing RAG instance")
 
-            # If a visualizer exists, update it with the new RAG instance
-            if self.visualizer:
-                self.visualizer.set_rag(self.rag)
-                self.logger.info("Updated visualizer with new RAG instance")
+            # Reset token counts for the new topic
+            self.context_token_count = 0
+            self.response_token_count = 0
+            self.total_tokens = 0
 
-        except Exception as e:
-            self.logger.error(f"Error creating new RAG instance: {str(e)}", exc_info=True)
-            self.logger.warning("Continuing with existing RAG instance")
+            # Emit signal to update token usage display in GUI
+            if self.is_gui:
+                self.token_usage_updated.emit(self.total_tokens)
 
-        # Reset token counts for the new topic
-        self.context_token_count = 0
-        self.response_token_count = 0
-        self.total_tokens = 0
-
-        # Emit signal to update token usage display in GUI
-        if self.is_gui:
-            self.token_usage_updated.emit(self.total_tokens)
-
-        # Clear the topic
-        self.update_conversation_topic("")
+            # Clear the topic
+            self.update_conversation_topic("")
+        else:
+            self.logger.info("Starting a new topic")
 
     def start_conversation(self):
         self.logger.info("Initializing new conversation")

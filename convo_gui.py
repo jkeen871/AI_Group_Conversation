@@ -67,7 +67,13 @@ class AIResponseThread(QThread):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            if self.is_initial_conversation:
+            if self.is_moderator_summary:
+                self.logger.debug("Generating moderator summary")
+                summary = loop.run_until_complete(
+                    self.conversation_manager.generate_moderator_summary()
+                )
+                self.response_received.emit("Moderator", summary, "System", "Moderator")
+            elif self.is_initial_conversation:
                 self.logger.debug("Generating initial AI conversation")
                 responses = loop.run_until_complete(
                     self.conversation_manager.generate_ai_conversation(self.prompt, self.active_participants)
@@ -79,7 +85,7 @@ class AIResponseThread(QThread):
                         if response_data:
                             response, ai_name, model = response_data
                             self.logger.debug(f"Emitting response from {participant}")
-                            # self.response_received.emit(participant, response, ai_name, model)
+                            self.response_received.emit(participant, response, ai_name, model)
                             loop.run_until_complete(asyncio.sleep(0.1))
 
                     # Check if a topic was generated
@@ -92,7 +98,7 @@ class AIResponseThread(QThread):
                         self.logger.debug("No topic was generated")
                 elif isinstance(responses, str):
                     self.logger.debug("Emitting system response")
-                    # self.response_received.emit("System", responses, "System", "System")
+                    self.response_received.emit("System", responses, "System", "System")
             else:
                 self.logger.debug("Continuing conversation")
                 response = loop.run_until_complete(
@@ -105,11 +111,11 @@ class AIResponseThread(QThread):
                         if response_data:
                             response, ai_name, model = response_data
                             self.logger.debug(f"Emitting response from {participant}")
-                            # self.response_received.emit(participant, response, ai_name, model)
+                            self.response_received.emit(participant, response, ai_name, model)
                             loop.run_until_complete(asyncio.sleep(0.1))
                 elif isinstance(response, str):
                     self.logger.debug("Emitting system response")
-                    # self.response_received.emit("System", response, "System", "System")
+                    self.response_received.emit("System", response, "System", "System")
         except Exception as e:
             self.logger.error(f"Error in AIResponseThread: {str(e)}", exc_info=True)
             self.error_occurred.emit(f"Error: {str(e)}")
@@ -144,102 +150,103 @@ class CodeBlockHighlighter(QSyntaxHighlighter):
         super().__init__(document)
         self.highlighting_rules = []
 
-        # Add rules for code block markers
         marker_format = QTextCharFormat()
-        marker_format.setForeground(QColor("#808080"))  # Grey color for markers
-        self.highlighting_rules.append((QRegExp("=== code begin ==="), marker_format))
-        self.highlighting_rules.append((QRegExp("=== code end ==="), marker_format))
+        marker_format.setForeground(QColor("#808080"))
+        self.highlighting_rules.append((re.compile(r""), marker_format))
+        self.highlighting_rules.append((re.compile(r""), marker_format))
 
     def highlightBlock(self, text):
         logger.debug(f"Highlighting code block: {text}")
-        if "=== code begin ===" in text or "=== code end ===" in text:
-            for pattern, format in self.highlighting_rules:
-                expression = QRegExp(pattern)
-                index = expression.indexIn(text)
-                while index >= 0:
-                    length = expression.matchedLength()
-                    self.setFormat(index, length, format)
-                    index = expression.indexIn(text, index + length)
+        for pattern, format in self.highlighting_rules:
+            for match in pattern.finditer(text):
+                start, end = match.span()
+                self.setFormat(start, end - start, format)
         logger.debug(f"Completed highlighting code block: {text}")
 
-
 class MarkdownFormatter:
-    def __init__(self, conversation_display):
+    def __init__(self, conversation_display, code_wrap_mode=QTextOption.NoWrap,
+                 text_wrap_mode=QTextOption.WrapAtWordBoundaryOrAnywhere):
         self.conversation_display = conversation_display
         self.code_block_highlighter = CodeBlockHighlighter(self.conversation_display.document())
         self.github_dark_style = get_style_by_name('github-dark')
         self.html_formatter = HtmlFormatter(style=self.github_dark_style, noclasses=True)
+        self.code_wrap_mode = code_wrap_mode
+        self.text_wrap_mode = text_wrap_mode
+        self.original_text_color = self.conversation_display.textColor()
         logger.debug(f"Initialized MarkdownFormatter with conversation_display: {conversation_display}")
+
 
     def format_text(self, cursor, text):
         logger.debug(f"Formatting text: {text} with cursor: {cursor}")
-        code_block_regex = re.compile(r'=== code begin ===\n([\s\S]+?)\n=== code end ===')
+        code_block_regex = re.compile(r'```(\w+)?\n([\s\S]+?)\n```')
         parts = code_block_regex.split(text)
         logger.debug(f"Split text into parts: {parts}")
 
-        for i, part in enumerate(parts):
-            if i % 2 == 0:  # Regular text
-                logger.debug(f"Inserting regular text part: {part}")
-                self.insert_regular_text(cursor, part)
-            else:  # Code block
-                logger.debug(f"Inserting code block part: {part}")
-                self.insert_code_block(cursor, part)
+        for i in range(0, len(parts), 3):
+            regular_text = parts[i]
+            logger.debug(f"Inserting regular text part: {regular_text}")
+            self.insert_regular_text(cursor, regular_text)
 
-        # Ensure the cursor is set for regular text formatting after handling parts
+            if i + 2 < len(parts):
+                language = parts[i+1]
+                code_block = parts[i+2]
+                logger.debug(f"Inserting code block part: {code_block} with language: {language}")
+                self.insert_code_block(cursor, code_block, language)
+
         self.reset_formatting(cursor)
 
     def insert_regular_text(self, cursor, text):
         logger.debug(f"Inserting regular text block: {text} with cursor: {cursor}")
-        # Ensure word wrap is enabled for regular text
         text_option = QTextOption()
-        text_option.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        text_option.setWrapMode(self.text_wrap_mode)
         cursor.document().setDefaultTextOption(text_option)
         cursor.insertText(text)
         logger.debug("Inserted regular text block.")
 
-    def insert_code_block(self, cursor, code):
-        logger.debug(f"Inserting code block: {code} with cursor: {cursor}")
+    def insert_code_block(self, cursor, code, language):
+        logger.debug(f"Inserting code block: {code} with cursor: {cursor} and language: {language}")
         try:
-            lexer = guess_lexer(code)
+            lexer = get_lexer_by_name(language)
         except Exception as e:
-            logger.error(f"Error guessing lexer: {e}")
+            logger.error(f"Error in lexer for language {language}: {e}. Using 'text' lexer.")
             lexer = get_lexer_by_name('text')
 
         highlighted_code = highlight(code, lexer, self.html_formatter)
         logger.debug(f"Highlighted code: {highlighted_code}")
 
-        # Save current word wrap mode
         original_wrap_mode = self.conversation_display.wordWrapMode()
         logger.debug(f"Original word wrap mode: {original_wrap_mode}")
 
-        # Set word wrap mode to wrap at word boundary or anywhere
-        self.conversation_display.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        self.conversation_display.setWordWrapMode(self.code_wrap_mode)
         logger.debug("Set word wrap mode for code block.")
 
-        # Insert the HTML code block
         cursor.insertHtml(highlighted_code)
         logger.debug("Inserted HTML code block.")
 
-        # Restore original word wrap mode
         self.conversation_display.setWordWrapMode(original_wrap_mode)
         logger.debug("Restored original word wrap mode.")
 
-        # Ensure no extra new line is added after the code block
         cursor.movePosition(QTextCursor.End)
         logger.debug("Moved cursor to end after code block.")
 
-        # Reset the format to ensure following text is normal
         self.reset_formatting(cursor)
 
     def reset_formatting(self, cursor):
-        cursor.setCharFormat(QTextCharFormat())
-        cursor.setBlockFormat(QTextBlockFormat())
+        char_format = QTextCharFormat()
+        char_format.setFont(cursor.document().defaultFont())
+        char_format.setForeground(QColor("#F5F5F5"))
+        cursor.setCharFormat(char_format)
+
+        block_format = QTextBlockFormat()
+        cursor.setBlockFormat(block_format)
+
         text_option = QTextOption()
         text_option.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
-        cursor.block().document().setDefaultTextOption(text_option)
+        cursor.document().setDefaultTextOption(text_option)
 
 
 class AIConversationGUI(QMainWindow):
+  #  ai_response_generated = pyqtSignal(str, str, str, str)
     def __init__(self):
         super().__init__()
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -374,10 +381,11 @@ class AIConversationGUI(QMainWindow):
 
         self.logger.info("Configuration applied to GUI elements")
 
+
     def init_ui(self):
         """
-        Initialize the user interface components.
-        """
+          Initialize the user interface components.
+          """
         self.logger.debug("Starting UI initialization")
 
         # Set window properties
@@ -415,18 +423,12 @@ class AIConversationGUI(QMainWindow):
         conversation_splitter.addWidget(conversation_group)
         self.logger.debug("Conversation display area set up")
 
-        # Set dark background for conversation display
-        palette = self.conversation_display.palette()
-        palette.setColor(QPalette.Base, QColor("#0d1117"))  # GitHub Dark background color
-        palette.setColor(QPalette.Text, QColor("#c9d1d9"))  # GitHub Dark text color
-        self.conversation_display.setPalette(palette)
-
         # Set up the multiline input area
         input_widget = self.setup_multiline_input()
         conversation_splitter.addWidget(input_widget)
         self.logger.debug("Multiline input area set up")
 
-        # Set initial sizes for the splitter (adjust as needed)
+        # Set initial sizes for the conversation splitter (adjust as needed)
         conversation_splitter.setSizes([300, 100])
 
         # Right panel (controls and status)
@@ -435,11 +437,12 @@ class AIConversationGUI(QMainWindow):
         splitter.addWidget(right_panel)
         self.logger.debug("Right panel created")
 
+
         self.setup_right_panel_controls(right_layout)
 
         self.setup_participant_selection(right_layout)
 
-        # Set up splitter proportions
+        # Set initial sizes for the main splitter
         splitter.setSizes([2 * self.width() // 3, self.width() // 3])
 
         # Status bar
@@ -819,16 +822,18 @@ class AIConversationGUI(QMainWindow):
             self.append_message("System", "Please enter a valid name.")
             self.prompt_for_name()
 
+
     def initialize_conversation_manager(self, name):
         self.logger.info(f"Initializing conversation manager for user: {name}")
         self.conversation_manager = ConversationManager(name, is_gui=True)
         self.conversation_manager.load_user_identity()
         self.setup_connections()
-        self.append_message("System", f"Welcome, {name}! You can now start the conversation.")
+        self.append_message("System",
+                            f"Welcome, {name}! You can now start the conversation by entering your first message.")
         self.user_input.clear()
 
-        self.user_input.setPlaceholderText("Type your message here...")
-        self.send_button.setText("Send")
+        self.user_input.setPlaceholderText("Type your message here to start the conversation...")
+        self.send_button.setText("Start Conversation")
         self.send_button.clicked.disconnect()
         self.send_button.clicked.connect(self.on_send_button_clicked)
 
@@ -842,9 +847,8 @@ class AIConversationGUI(QMainWindow):
         # Enable the send button for future messages
         self.send_button.setEnabled(True)
 
-        # Start the conversation
-        self.start_conversation()
-        self.logger.info("Conversation manager initialized and conversation started")
+        self.logger.info("Conversation manager initialized, waiting for first user input")
+
 
     def setup_connections(self):
         self.logger.debug("Setting up signal-slot connections")
@@ -855,7 +859,9 @@ class AIConversationGUI(QMainWindow):
             self.conversation_manager.token_usage_updated.connect(self.update_token_usage)
             self.conversation_manager.user_identity_loaded.connect(self.on_user_identity_loaded)
             self.conversation_manager.ai_response_generated.connect(self.update_conversation_window)
-            self.logger.debug("Signal-slot connections set up successfully")
+            self.conversation_manager.ai_thinking_started.connect(self.on_ai_thinking_started)
+            self.conversation_manager.ai_thinking_finished.connect(self.on_ai_thinking_finished)
+            self.logger.debug("Connected ConversationManager signals to appropriate slots")
         else:
             self.logger.warning("Cannot set up connections: conversation_manager is None")
 
@@ -1004,12 +1010,13 @@ class AIConversationGUI(QMainWindow):
         self.reset_formatting(cursor)
         logger.debug("Final reset of formatting after message.")
 
+
     def append_message(self, sender, message, ai_name=None, model=None):
-        logger.debug(f"Appending message from {sender}: {message}")
+        self.logger.debug(f"Appending message from {sender}: {message}")
 
         cursor = self.conversation_display.textCursor()
         cursor.movePosition(QTextCursor.End)
-        logger.debug("Cursor moved to end of conversation display.")
+        self.logger.debug("Cursor moved to end of conversation display.")
 
         # Insert two empty lines before new messages (one extra for spacing)
         self.insert_empty_lines(cursor, 2)
@@ -1034,20 +1041,25 @@ class AIConversationGUI(QMainWindow):
         # Insert header
         cursor.setCharFormat(header_format)
         cursor.insertText(f"{sender}: ")
-        logger.debug(f"Inserted header for {sender}.")
+        self.logger.debug(f"Inserted header for {sender}.")
 
         # Insert divider line
         self.insert_divider(cursor)
-        logger.debug("Inserted divider line.")
+        self.logger.debug("Inserted divider line.")
 
-        # Insert message content
-        self.insert_message_content(cursor, message)
-        logger.debug("Inserted message content.")
+        # Check if this is a topic message
+        if sender == "System" and message.startswith("Conversation topic:"):
+            self.insert_topic_message(cursor, message)
+        else:
+            # Insert regular message content
+            self.insert_message_content(cursor, message)
+
+        self.logger.debug("Inserted message content.")
 
         # Ensure the new message is visible
         self.conversation_display.setTextCursor(cursor)
         self.conversation_display.ensureCursorVisible()
-        logger.debug("Set cursor to new message and ensured visibility.")
+        self.logger.debug("Set cursor to new message and ensured visibility.")
 
         # Update conversation history
         if self.conversation_manager and self.conversation_manager.current_thread_id:
@@ -1075,13 +1087,27 @@ class AIConversationGUI(QMainWindow):
             Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
         )
 
+
     @pyqtSlot(str)
-    def on_ai_thinking_started(self, participant):
+    def on_ai_thinking_started(self, participant: str):
+        """
+          Handle the start of AI thinking process.
+
+          Args:
+              participant (str): The name of the AI participant that started thinking
+          """
         self.logger.debug(f"AI thinking started: {participant}")
         self.update_status_bar(f"{participant} is thinking...")
 
+
     @pyqtSlot(str)
-    def on_ai_thinking_finished(self, participant):
+    def on_ai_thinking_finished(self, participant: str):
+        """
+          Handle the end of AI thinking process.
+
+          Args:
+              participant (str): The name of the AI participant that finished thinking
+          """
         self.logger.debug(f"AI thinking finished: {participant}")
         self.update_status_bar("Ready")
 
@@ -1096,19 +1122,27 @@ class AIConversationGUI(QMainWindow):
         self.logger.debug(f"User identity loaded: {greeting}")
         self.append_message("System", greeting)
 
+
     @pyqtSlot(str, str, str, str)
-    def update_conversation_window(self, participant, response, ai_name, model):
+    def update_conversation_window(self, participant: str, response: str, ai_name: str, model: str):
+        """
+          Update the conversation window with a new message.
+
+          This method is called when a new AI response is generated, including the moderator summary.
+
+          Args:
+              participant (str): The name of the participant who generated the response
+              response (str): The content of the response
+              ai_name (str): The name of the AI model used
+              model (str): The specific model version used
+          """
         self.logger.debug(f"Updating conversation window: {participant}")
         if response:  # Only append non-empty responses
-            # Check if the last message is the same as the new one
-            last_message = self.conversation_display.toPlainText().split('\n')[-1]
-            if not last_message.startswith(f"{participant}:") or last_message.split(':', 1)[
-                1].strip() != response.strip():
-                self.append_message(participant, response, ai_name, model)
-                self.update_token_usage(self.conversation_manager.get_token_usage()['total_tokens'])
-            else:
-                self.logger.debug(f"Skipping duplicate message from {participant}")
-        QApplication.processEvents()  # Force GUI update
+            self.append_message(participant, response, ai_name, model)
+            self.update_token_usage(self.conversation_manager.get_token_usage()['total_tokens'])
+            self.logger.debug(f"Appended message from {participant} to conversation window")
+        else:
+            self.logger.warning(f"Received empty response from {participant}")
 
     @pyqtSlot(str)
     def on_topic_generated(self, topic):
@@ -1147,11 +1181,19 @@ class AIConversationGUI(QMainWindow):
         self.token_label.setText(f"Total Tokens: {total_tokens}")
 
     @pyqtSlot(str)
-    def on_error_occurred(self, error_message):
+    def on_error_occurred(self, error_message: str):
+        """
+        Handle errors that occur during conversation or moderator summary generation.
+
+        Args:
+            error_message (str): The error message to display
+        """
         self.logger.error(f"Error in conversation: {error_message}")
         self.update_status_bar("Error occurred")
         self.append_message("System", f"An error occurred: {error_message}")
         self.send_button.setEnabled(True)
+        self.logger.info("GUI updated after error occurrence")
+
 
     @pyqtSlot(str, str, str, str)
     def handle_ai_response(self, participant, response, ai_name, model):
@@ -1160,6 +1202,7 @@ class AIConversationGUI(QMainWindow):
 
     # else:
     #    self.update_conversation_window(participant, response, ai_name, model)
+
 
     def on_send_button_clicked(self):
         self.logger.debug("Send button clicked")
@@ -1177,7 +1220,10 @@ class AIConversationGUI(QMainWindow):
                 if self.conversation_manager:
                     self.conversation_manager.reset_interrupt()  # Reset interrupt flag
                 self.send_message(user_input)
+                if self.conversation_manager.is_first_prompt:
+                    self.send_button.setText("Send")  # Change button text after first message
             self.user_input.clear()
+
 
     def continue_conversation(self, user_input):
         """
@@ -1236,14 +1282,15 @@ class AIConversationGUI(QMainWindow):
         if self.response_thread and self.response_thread.isFinished():
             self.on_conversation_completed()
 
+
     def on_conversation_completed(self):
-        self.logger.debug("Conversation round completed")
+        """
+          Handle the completion of a conversation round or moderator summary generation.
+          """
+        self.logger.debug("Conversation or moderator summary generation completed")
         self.update_status_bar("Ready")
         self.send_button.setEnabled(True)
-
-        # Topic generation is now handled in generate_ai_conversation
-        if not self.topic_generated:
-            self.check_and_generate_topic()
+        self.logger.info("GUI updated after conversation completion")
 
     def update_vector_graph(self):
         if self.vector_graph:
@@ -1270,17 +1317,49 @@ class AIConversationGUI(QMainWindow):
         else:
             self.append_message("System", "Unknown command. Type !Help for available commands.")
 
+
     def generate_moderator_summary(self):
-        self.logger.info("Generating moderator summary")
+        """
+          Initiate the generation of a moderator summary for the current conversation.
+
+          This method creates and starts an AIResponseThread to generate the summary asynchronously.
+          """
+        self.logger.info("Initiating moderator summary generation")
         self.update_status_bar("Generating moderator summary...")
 
-        # Create and start the AIResponseThread for moderator summary
-        self.response_thread = AIResponseThread(self.conversation_manager, "", is_initial_conversation=False,
-                                                is_moderator_summary=True)
-        self.response_thread.response_received.connect(self.on_response_received)
+        self.response_thread = AIResponseThread(
+            self.conversation_manager,
+            "",
+            is_initial_conversation=False,
+            is_moderator_summary=True
+        )
+        self.response_thread.response_received.connect(self.on_moderator_summary_received)
         self.response_thread.conversation_completed.connect(self.on_conversation_completed)
         self.response_thread.error_occurred.connect(self.on_error_occurred)
         self.response_thread.start()
+
+        self.logger.debug("AIResponseThread for moderator summary started")
+
+
+    @pyqtSlot(str, str, str, str)
+    def on_moderator_summary_received(self, participant: str, response: str, ai_name: str, model: str):
+        """
+          Handle the reception of the moderator summary.
+
+          This method is called when the moderator summary is generated.
+
+          Args:
+              participant (str): Should be "Moderator"
+              response (str): The generated summary
+              ai_name (str): The name of the AI model used
+              model (str): The specific model version used
+          """
+        self.logger.info("Received moderator summary")
+        self.update_status_bar("Moderator summary received")
+
+        # Use the existing method to update the conversation window
+        self.update_conversation_window(participant, response, ai_name, model)
+
 
     def new_topic(self):
         self.logger.info("Starting a new topic")
@@ -1314,9 +1393,36 @@ class AIConversationGUI(QMainWindow):
             self.logger.error("Cannot start new topic: conversation_manager is None")
             self.append_message("System", "Error: Cannot start a new topic. Please initialize the conversation first.")
 
+
     def update_topic_display(self, topic):
-        self.topic_label.setText(f"Topic: {topic}")
+        # Remove any potential formatting characters and extra spaces
+        plain_topic = self.clean_topic_string(topic)
+        self.topic_label.setText(f"Topic: {plain_topic}")
         self.topic_label.setStyleSheet("font-weight: bold; color: #58a6ff;")
+        self.logger.debug(f"Updated topic display: {plain_topic}")
+
+
+    def clean_topic_string(self, topic):
+        # Remove any extra spaces and potential formatting characters
+        import re
+        cleaned_topic = re.sub(r'\s+', ' ', topic).strip()
+        # Remove any potential markdown or other formatting characters
+        cleaned_topic = re.sub(r'[*_`#]+', '', cleaned_topic)
+        return cleaned_topic
+
+
+    def insert_topic_message(self, cursor, message):
+        # Extract and clean the topic
+        _, topic = message.split(":", 1)
+        cleaned_topic = self.clean_topic_string(topic)
+
+        # Use the default text format for the topic
+        cursor.setCharFormat(QTextCharFormat())
+        cursor.insertText(f"New Conversation Topic: {cleaned_topic}\n")
+        self.logger.debug(f"Inserted cleaned topic: {cleaned_topic}")
+
+        # Update the topic display
+        self.update_topic_display(cleaned_topic)
 
     def display_help(self):
         self.logger.debug("Displaying help information")
@@ -1330,7 +1436,14 @@ class AIConversationGUI(QMainWindow):
         """
         self.append_message("System", help_text)
 
-    def update_status_bar(self, message):
+
+    def update_status_bar(self, message: str):
+        """
+          Update the status bar with a new message.
+
+          Args:
+              message (str): The message to display in the status bar
+          """
         self.logger.debug(f"Updating status bar: {message}")
         self.statusBar().showMessage(message)
 
