@@ -28,6 +28,7 @@ from EditAIConfigs import EditAIConfigs
 from EditHelperPersonalties import EditHelperPersonalities
 import asyncio
 from typing import List
+from formattedtextedit import FormattedTextEdit
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -549,28 +550,35 @@ class AIConversationGUI(QMainWindow):
         button_grid.addWidget(self.interrupt_button, (len(buttons_info) + 1) // 2, 0, 1, 2)
         self.logger.debug("Interrupt button added")
 
+
     def open_history_window(self):
         """
-        Open the conversation history window.
-        """
+          Open the conversation history window.
+          """
         self.logger.debug("Opening conversation history window")
         if self.history_window is None:
-            self.history_window = ConversationHistoryWindow(self)
+            self.history_window = ConversationHistoryWindow(
+                self,
+                insert_header=self.insert_header,
+                insert_divider=self.insert_divider,
+                insert_message_content=self.insert_message_content,
+                reset_formatting=self.reset_formatting,
+                config=self.config
+            )
         self.history_window.show()
+
 
     def setup_multiline_input(self):
         """
-        Set up a multiline, scrollable input area for user messages.
-        """
-        self.logger.debug("Setting up multiline input area")
+          Set up a multiline, scrollable input area for user messages with formatting controls.
+          """
+        self.logger.debug("Setting up multiline input area with formatting controls")
 
         input_container = QWidget()
         input_layout = QVBoxLayout(input_container)
 
-        # Create multiline input box
-        self.user_input = CustomTextEdit(self)
-        self.user_input.setAcceptRichText(False)
-        self.user_input.setMinimumHeight(100)
+        # Create formatted input box
+        self.user_input = FormattedTextEdit(self)
         self.user_input.setPlaceholderText("Type your message here...")
         input_layout.addWidget(self.user_input)
 
@@ -583,7 +591,7 @@ class AIConversationGUI(QMainWindow):
 
         input_layout.addLayout(button_layout)
 
-        self.logger.debug("Multiline input area set up successfully")
+        self.logger.debug("Multiline input area with formatting controls set up successfully")
         return input_container
 
     def setup_font_controls(self, parent_layout):
@@ -935,12 +943,20 @@ class AIConversationGUI(QMainWindow):
         cursor.insertText('-' * 50)  # 50 dashes for the divider line
         cursor.insertBlock()
 
+
     def reset_formatting(self, cursor):
-        cursor.setCharFormat(QTextCharFormat())
-        cursor.setBlockFormat(QTextBlockFormat())
+        char_format = QTextCharFormat()
+        char_format.setFont(cursor.document().defaultFont())
+        char_format.setForeground(QColor(self.config['conversation_font_color']))
+        cursor.setCharFormat(char_format)
+
+        block_format = QTextBlockFormat()
+        cursor.setBlockFormat(block_format)
+
         text_option = QTextOption()
         text_option.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
-        cursor.block().document().setDefaultTextOption(text_option)
+        cursor.document().setDefaultTextOption(text_option)
+
 
     def insert_message_content(self, cursor, message):
         # Set up content format
@@ -998,9 +1014,9 @@ class AIConversationGUI(QMainWindow):
                 self.markdown_formatter.format_text(cursor, part)
                 logger.debug("Formatted regular text part.")
 
-                # Reset to content format after markdown formatting
-                cursor.setCharFormat(content_format)
-                logger.debug("Reset content format after markdown formatting.")
+            # Reset to content format after processing each part
+            cursor.setCharFormat(content_format)
+            logger.debug("Reset content format after processing part.")
 
         # Ensure there's a new line after the message
         cursor.insertBlock()
